@@ -46,6 +46,13 @@ outer.top = [{ monitor.'built-in' = 2 }, 34]
 # AeroSpace owns focus and workspaces; the zone helper places resizable
 # desktop windows. Float every new window before asking it to claim a zone.
 # The helper excludes dialogs and native fullscreen windows itself.
+# Place new IINA windows on the visible CR9 workspace before first layout.
+# Existing windows and manager restarts keep their current assignment.
+[[on-window-detected]]
+if.app-id = 'com.colliderli.iina'
+if.during-aerospace-startup = false
+run = ['layout floating', 'move-node-to-monitor C49RG9']
+
 [[on-window-detected]]
 if = 'true'
 run = ['layout floating']
