@@ -375,12 +375,25 @@ struct WindowTitle: Equatable {
     let workspace: String
     let title: String
     let appName: String
+    var nativeTab: AXUIElement? = nil
+    var nativeSelected = true
+
+    static func == (lhs: WindowTitle, rhs: WindowTitle) -> Bool {
+        guard lhs.id == rhs.id, lhs.workspace == rhs.workspace,
+              lhs.title == rhs.title, lhs.appName == rhs.appName,
+              lhs.nativeSelected == rhs.nativeSelected else { return false }
+        switch (lhs.nativeTab, rhs.nativeTab) {
+        case (nil, nil): return true
+        case let (a?, b?): return CFEqual(a, b)
+        default: return false
+        }
+    }
 }
 
-// Every managed window appears in the same ascending-ID order as the cycle
-// command, including singletons and windows without a document title.
-func workspaceWindowTitles(from rows: [[String: Any]]) -> [WindowTitle] {
-    rows.compactMap { row -> WindowTitle? in
+// Standalone windows retain stable ID order. Native Ghostty tabs come from
+// the actual tab strip; inactive tabs are not independent desktop windows.
+func workspaceWindowTitles(from rows: [[String: Any]], ghosttyTabs: [WindowTitle]? = nil) -> [WindowTitle] {
+    let windows = rows.compactMap { row -> WindowTitle? in
         guard let id = row["window-id"] as? Int,
               let workspace = row["workspace"] as? String else { return nil }
         let app = row["app-name"] as? String ?? ""
@@ -391,6 +404,75 @@ func workspaceWindowTitles(from rows: [[String: Any]]) -> [WindowTitle] {
                            title: title.isEmpty ? "\(app.isEmpty ? "Window" : app) \(id)" : title,
                            appName: app)
     }.sorted { $0.id < $1.id }
+    guard let tabs = ghosttyTabs, !tabs.isEmpty else { return windows }
+    let ghosttyIDs = Set(rows.filter { $0["app-bundle-id"] as? String == "com.mitchellh.ghostty" }
+        .compactMap { $0["window-id"] as? Int })
+    var inserted = false
+    return windows.flatMap { window -> [WindowTitle] in
+        guard ghosttyIDs.contains(window.id) else { return [window] }
+        if inserted { return [] }
+        inserted = true
+        return tabs
+    }
+}
+
+@_silgen_name("_AXUIElementGetWindow")
+func AXWindowID(_ element: AXUIElement, _ id: UnsafeMutablePointer<UInt32>) -> AXError
+
+func nativeGhosttyTitles(from rows: [[String: Any]]) -> [WindowTitle]? {
+    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.mitchellh.ghostty").first else { return nil }
+    let application = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(application, 0.15)
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &ref) == .success,
+          let windows = ref as? [AXUIElement] else { return nil }
+    var groups: [(Int, [WindowTitle])] = []
+    for window in windows {
+        var id: UInt32 = 0
+        guard AXWindowID(window, &id) == .success,
+              let row = rows.first(where: { $0["window-id"] as? Int == Int(id) }),
+              let workspace = row["workspace"] as? String else { continue }
+        let group = axChildren(window).first { axString($0, "AXRole") == "AXTabGroup" }
+        let tabs = group.map { axChildren($0).filter { axString($0, "AXSubrole") == "AXTabButton" } } ?? []
+        if tabs.isEmpty {
+            groups.append((Int(id), [WindowTitle(id: Int(id), workspace: workspace,
+                title: axString(window, "AXTitle"), appName: "Ghostty")]))
+        } else {
+            groups.append((Int(id), tabs.map { tab in
+                var value: CFTypeRef?
+                AXUIElementCopyAttributeValue(tab, kAXValueAttribute as CFString, &value)
+                return WindowTitle(id: Int(id), workspace: workspace,
+                    title: axString(tab, "AXTitle"), appName: "Ghostty",
+                    nativeTab: tab, nativeSelected: (value as? NSNumber)?.boolValue == true)
+            }))
+        }
+    }
+    // A failed/incomplete AX snapshot must not erase managed windows.
+    let knownWorkspaces = Set(rows.filter { $0["app-bundle-id"] as? String == "com.mitchellh.ghostty" }
+        .compactMap { $0["workspace"] as? String })
+    let result = groups.sorted { $0.0 < $1.0 }.flatMap { $0.1 }
+    guard Set(result.map { $0.workspace }) == knownWorkspaces else { return nil }
+    return result.isEmpty ? nil : result
+}
+
+// Reuse the last WM membership snapshot for native focus/title/order events.
+// Tab changes never need a WM subprocess or a poll.
+var windowTitleRows: [[String: Any]] = []
+var nativeTitleRefreshRunning = false
+var nativeTitleRefreshAgain = false
+func refreshNativeTitles() {
+    guard !nativeTitleRefreshRunning else { nativeTitleRefreshAgain = true; return }
+    guard !windowTitleRows.isEmpty else { return }
+    nativeTitleRefreshRunning = true
+    let rows = windowTitleRows
+    rebuildQueue.async {
+        let titles = workspaceWindowTitles(from: rows, ghosttyTabs: nativeGhosttyTitles(from: rows))
+        DispatchQueue.main.async {
+            nativeTitleRefreshRunning = false
+            if titles != model.windowTitles { model.windowTitles = titles; repaint() }
+            if nativeTitleRefreshAgain { nativeTitleRefreshAgain = false; refreshNativeTitles() }
+        }
+    }
 }
 
 // One queue owns WM snapshot reads, including titles. Independent readers
@@ -404,11 +486,12 @@ func refreshWindowTitles() {
     rebuildQueue.async {
         let text = aerospace(["list-windows", "--all", "--format", "%{window-id} %{app-bundle-id} %{app-name} %{workspace} %{window-title}", "--json"])
         let rows = text.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [[String: Any]]
-        let titles = workspaceWindowTitles(from: rows ?? [])
+        let titles = workspaceWindowTitles(from: rows ?? [], ghosttyTabs: nativeGhosttyTitles(from: rows ?? []))
         let focused = Int(aerospace(["list-windows", "--focused", "--format", "%{window-id}"]).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         DispatchQueue.main.async {
             windowTitleRefreshRunning = false
-            guard rows != nil else { return }
+            guard let rows else { return }
+            windowTitleRows = rows
             if titles != model.windowTitles || focused != model.focusedWindowID {
                 model.windowTitles = titles
                 model.focusedWindowID = focused
@@ -2554,7 +2637,7 @@ final class BarView: NSView {
     var chipRects: [(String, NSRect)] = []
     var itemRects: [(String, NSRect)] = []
     var mediaRects: [(String, NSRect)] = []
-    var windowTitleRects: [(Int, NSRect)] = []
+    var windowTitleRects: [(WindowTitle, NSRect)] = []
     var appleRect: NSRect = .zero
 
     override var isFlipped: Bool { false }
@@ -2758,7 +2841,7 @@ final class BarView: NSView {
                 paragraph.lineBreakMode = .byTruncatingMiddle
                 for (index, terminal) in windowTitles.enumerated() {
                     let box = NSRect(x: start + CGFloat(index) * width, y: (barHeight - pillHeight) / 2, width: width, height: pillHeight)
-                    let active = terminal.id == model.focusedWindowID
+                    let active = terminal.id == model.focusedWindowID && terminal.nativeSelected
                     palette.barBG.withAlphaComponent(1).setFill()
                     NSBezierPath(roundedRect: box, xRadius: radius, yRadius: radius).fill()
                     let icon = appIcon(terminal.appName)
@@ -2769,7 +2852,7 @@ final class BarView: NSView {
                     let title = "\(index + 1) \(terminal.title)"
                     (title as NSString).draw(in: NSRect(x: box.minX + 6 + iconWidth, y: box.midY - 8, width: max(0, box.width - 12 - iconWidth), height: 17), withAttributes: [
                         .font: nerdFont("SemiBold", 12), .foregroundColor: active ? palette.accent : palette.muted, .paragraphStyle: paragraph])
-                    windowTitleRects.append((terminal.id, box))
+                    windowTitleRects.append((terminal, box))
                     addToolTip(box, owner: terminal.title as NSString, userData: nil)
                 }
             }
@@ -2801,9 +2884,29 @@ final class BarView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         if let target = windowTitleRects.first(where: { $0.1.contains(p) })?.0 {
             DispatchQueue.global(qos: .userInitiated).async {
-                aerospace(["focus", "--window-id", String(target)])
-                aerospace(["move-mouse", "window-lazy-center"])
-                DispatchQueue.main.async { refreshWindowTitles() }
+                if let tab = target.nativeTab {
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    var ref: CFTypeRef?
+                    let lookup = AXUIElementCopyAttributeValue(tab, kAXWindowAttribute as CFString, &ref)
+                    guard lookup == .success, let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else {
+                        DispatchQueue.main.async { refreshNativeTitles() }; return
+                    }
+                    let window = ref as! AXUIElement
+                    let raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                    let pressed = AXUIElementPerformAction(tab, kAXPressAction as CFString)
+                    var pid: pid_t = 0
+                    AXUIElementGetPid(tab, &pid)
+                    NSRunningApplication(processIdentifier: pid)?.activate()
+                    let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                    DispatchQueue.main.async {
+                        tlog(String(format: "native-tab press %.2f ms raise=%d press=%d", ms, raised.rawValue, pressed.rawValue))
+                        refreshNativeTitles()
+                    }
+                } else {
+                    aerospace(["focus", "--window-id", String(target.id)])
+                    aerospace(["move-mouse", "window-lazy-center"])
+                    DispatchQueue.main.async { refreshWindowTitles() }
+                }
             }
             return
         }
@@ -3648,6 +3751,7 @@ let notify: NotifyProc = { event, _, _, _ in
         // querying the WM here races both of those owners. Workspace moves
         // are covered by the explicit moved signal above.
         kickVisibility()
+        if event == EVENT_WINDOW_ORDER { refreshNativeTitles() }
     }
 }
 _ = SLSRegisterNotifyProc(notify, EVENT_WINDOW_CREATE, nil)
@@ -3851,6 +3955,11 @@ DistributedNotificationCenter.default().addObserver(
     guard let info = note.userInfo, let kind = info["kind"] as? String else { return }
     guard let id = info["id"] as? Int, kind == "title" || kind == "focus" else {
         kickRebuild()
+        return
+    }
+    if model.windowTitles.contains(where: { $0.id == id && $0.appName == "Ghostty" }) {
+        if kind == "focus" { model.focusedWindowID = id }
+        refreshNativeTitles()
         return
     }
     if let rawTitle = info["title"] as? String,

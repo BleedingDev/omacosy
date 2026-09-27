@@ -71,7 +71,7 @@
             ]
           },
           {
-            "description": "Ghostty: Command Tab cycles windows on the current display and workspace",
+            "description": "Ghostty: Command Tab switches native tabs directly",
             "manipulators": [
               {
                 "type": "basic",
@@ -89,7 +89,11 @@
                 },
                 "to": [
                   {
-                    "shell_command": "/Users/satan/.local/bin/omacosy-cycle ghostty-prev"
+                    "key_code": "tab",
+                    "modifiers": [
+                      "left_control",
+                      "left_shift"
+                    ]
                   }
                 ],
                 "conditions": [
@@ -116,7 +120,10 @@
                 },
                 "to": [
                   {
-                    "shell_command": "/Users/satan/.local/bin/omacosy-cycle ghostty-next"
+                    "key_code": "tab",
+                    "modifiers": [
+                      "left_control"
+                    ]
                   }
                 ],
                 "conditions": [

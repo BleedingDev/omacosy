@@ -43,24 +43,16 @@ case "$dir" in
         ;;
     esac
     ;;
-  ghostty-next) dir=next; ghostty_only=1 ;;
-  ghostty-prev) dir=prev; ghostty_only=1 ;;
   next|prev) ;;
   *) exit 2 ;;
 esac
 
 
-if [ "${ghostty_only:-0}" = 1 ]; then
-  # Guard the asynchronous command as well as the Karabiner app condition.
-  [ "$("$A" list-windows --focused --format '%{app-bundle-id}' 2>/dev/null)" = com.mitchellh.ghostty ] || exit 0
-  WINS="$("$A" list-windows --workspace focused --monitor focused --app-bundle-id com.mitchellh.ghostty --format '%{window-id}' 2>/dev/null)"
-else
-  WINS="$("$A" list-windows --workspace focused --format '%{window-id}' 2>/dev/null)"
-fi
+WINS="$("$A" list-windows --workspace focused --format '%{window-id}' 2>/dev/null)"
 [ -n "$WINS" ] || exit 0
 CURRENT="$("$A" list-windows --focused --format '%{window-id}' 2>/dev/null || true)"
 
-# Match the bar's stable ascending window-ID order, not AeroSpace tree order.
+# Stable order for workspace windows; native Ghostty tab shortcuts bypass this script.
 target="$(printf '%s\n' $WINS | sort -n | awk -v cur="$CURRENT" -v dir="$dir" '
   { w[NR] = $0 }
   END {
