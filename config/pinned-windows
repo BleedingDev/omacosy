@@ -1,0 +1,11 @@
+# Pinned floating windows: kept on their rule's workspace so AeroSpace
+# never stashes them apart from it. One rule per line, '#' comments.
+#
+#   <matcher>                keeps the FOCUSED workspace
+#   <matcher> >> <anchor>    keeps the workspace of the first window
+#                            matching <anchor>
+#
+# Matchers are case-insensitive substrings of "<AppName> <WindowTitle>".
+# A game overlay must live with the game, not with the workspace the app
+# was started from:
+Firestone Overlay >> Hearthstone

@@ -131,6 +131,10 @@ func deviceName(_ id: AudioDeviceID) -> String {
 
 let args = CommandLine.arguments
 switch args.count > 1 ? args[1] : "" {
+case "zones":
+    runZones(Array(args.dropFirst(2)))
+case "pins":
+    runPins(Array(args.dropFirst(2)))
 case "cursor":
     // `cursor set X Y` warps without synthesising movement, which is
     // exactly what a script wants: focus-follows-mouse is movement-gated,

@@ -11,108 +11,79 @@ persistent-workspaces = ['1', '2', '3', '4', '5', '6', '7', '8', '9',
 
 start-at-login = true
 after-login-command = []
-after-startup-command = []
+after-startup-command = ['exec-and-forget $HOME/.local/bin/omacosy-helper zones sync', 'exec-and-forget $HOME/.local/bin/omacosy-native-spaces snapshot']
 
-# flatten is OFF because it dissolves the very container `split` makes,
-# and `split` is how the dwindle direction gets set (see below).
-# AeroSpace says so itself if you try: "'split' has no effect when
-# 'enable-normalization-flatten-containers' normalization enabled".
-# Empty containers are still reaped without it — closing a window hands
-# its space back to its sibling, which is the part that mattered.
-# opposite-orientation stays OFF — it is the inverse of Hyprland's
-# preserve_split=true and made Super+J's togglesplit cascade through
-# every nested container instead of flipping the one pair.
-enable-normalization-flatten-containers = false
-enable-normalization-opposite-orientation-for-nested-containers = false
-
-accordion-padding = 30
-default-root-container-layout = 'tiles'
-# 'auto' = split along the monitor's longer edge, which is the same
-# rule the dwindle hint below applies to every window after it
-default-root-container-orientation = 'auto'
-
-on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
-
-# Hyprland's dwindle splits the focused window along ITS longer edge,
-# so the next window lands beside a wide one and below a tall one.
-# AeroSpace has no such layout and no window geometry in its config
-# language (the format variables are ids, titles and container layouts
-# — no width or height), so the direction is decided in code and set
-# with `split` BEFORE the next window exists. AeroSpace then places
-# that window correctly in its first pass; the old daemon corrected the
-# tree afterwards, which is why the screen used to lay out twice.
-#
-# One hook covers both ways focus moves: AeroSpace fires it for its own
-# keyboard commands AND for the focus omacosy-ffm moves under the mouse
-# (it does notice those, despite moving focus via SLPS itself).
-# AEROSPACE_WINDOW_ID names the newly focused window.
-on-focus-changed = ['exec-and-forget $HOME/.local/bin/omacosy-helper split-hint']
+# Window geometry is owned by the gapless zone helper. Focus never splits
+# containers. Normal windows float so empty columns remain available.
+enable-normalization-flatten-containers = true
+enable-normalization-opposite-orientation-for-nested-containers = true
+accordion-padding = 0
+default-root-container-layout = 'accordion'
+default-root-container-orientation = 'horizontal'
+on-focused-monitor-changed = []
+# Focus callbacks run before hidden frames have necessarily settled. Warping
+# here generated mouse motion over stale geometry and re-triggered hover focus.
+# Explicit within-workspace cycling moves the cursor after choosing its window.
+on-focus-changed = []
 
 # Tell the bar which workspace is focused — a bash builtin redirect,
 # no extra process, and a regular file so a dead reader cannot wedge it
 exec-on-workspace-change = ['/bin/bash', '-c',
-  'touch /tmp/omacosy-ws-switch; echo "$AEROSPACE_FOCUSED_WORKSPACE" > /tmp/omacosy-bar-ws; $HOME/.local/bin/omacosy-focus-guard'
+  'touch /tmp/omacosy-ws-switch; echo "$AEROSPACE_FOCUSED_WORKSPACE" > /tmp/omacosy-bar-ws; ($HOME/.local/bin/omacosy-helper zones sync >>"$HOME/.local/state/omacosy/zones.log" 2>&1 &); $HOME/.local/bin/omacosy-focus-guard'
 ]
 
 [gaps]
-inner.horizontal = 8
-inner.vertical = 8
-outer.left = 8
-outer.bottom = 8
-outer.right = 8
+inner.horizontal = 0
+inner.vertical = 0
+outer.left = 0
+outer.bottom = 0
+outer.right = 0
 # room for the bar: measured from the display top on flat monitors,
 # but from below the notch strip on built-in notched displays (macOS
 # reports usable space starting there), so the laptop needs less
-outer.top = [{ monitor.'built-in' = 10 }, 42]
+outer.top = [{ monitor.'built-in' = 2 }, 34]
 
-# Fixed-size settings windows fight the tiler (resize -> snap back ->
-# relayout flicker); float them instead.
+# AeroSpace owns focus and workspaces; the zone helper places resizable
+# desktop windows. Float every new window before asking it to claim a zone.
+# The helper excludes dialogs and native fullscreen windows itself.
 [[on-window-detected]]
-if.app-id = 'org.pqrs.Karabiner-Elements.Settings'
-run = 'layout floating'
-
-[[on-window-detected]]
-if.app-id = 'com.apple.systempreferences'
-run = 'layout floating'
-
-# TUI utility windows (activity monitor etc.) float like omarchy's
-[[on-window-detected]]
-if.window-title-regex-substring = 'omacosy-activity'
-run = 'layout floating'
+if = 'true'
+run = ['layout floating']
 
 # Omarchy's map, Super = Caps Lock (cmd-ctrl-alt). Two layers, like
 # omarchy: Super for window management, Super+Shift for moving and apps.
 [mode.main.binding]
-# Terminal / browser (omarchy: Super+Return, Super+Shift+Return)
-# through omacosy-spawn: spawns are serialized so each window's dwindle
-# split hint lands before the next window opens — spamming this chord
-# gives a clean spiral instead of a simultaneous flat pile
-cmd-ctrl-alt-enter = 'exec-and-forget $HOME/.local/bin/omacosy-spawn "@TERMINAL@"'
+# Focus terminal/browser apps; Cmd+N in Ghostty opens a separate window.
+cmd-ctrl-alt-enter = 'exec-and-forget open -a "@TERMINAL@"'
 cmd-ctrl-alt-shift-enter = 'exec-and-forget open -a "@BROWSER@"'
 
 # Launcher (omarchy: Super+Space)
 cmd-ctrl-alt-space = 'exec-and-forget open -a Raycast'
 
 # Close window (omarchy: Super+W)
-cmd-ctrl-alt-w = 'close'
+# Close remains a native app action during this setup.
 
-# Focus (omarchy: Super+Arrows)
-cmd-ctrl-alt-left = 'focus left'
-cmd-ctrl-alt-down = 'focus down'
-cmd-ctrl-alt-up = 'focus up'
-cmd-ctrl-alt-right = 'focus right'
+# Focus: Vim home row and arrow aliases; vertical navigation switches displays.
+cmd-ctrl-alt-left = 'focus --boundaries all-monitors-outer-frame left'
+cmd-ctrl-alt-down = 'focus-monitor down'
+cmd-ctrl-alt-up = 'focus-monitor up'
+cmd-ctrl-alt-right = 'focus --boundaries all-monitors-outer-frame right'
+cmd-ctrl-alt-h = 'exec-and-forget $HOME/.local/bin/omacosy-cycle left'
+cmd-ctrl-alt-j = 'focus-monitor down'
+cmd-ctrl-alt-k = 'focus-monitor up'
+cmd-ctrl-alt-l = 'exec-and-forget $HOME/.local/bin/omacosy-cycle right'
 
 # Move windows (omarchy: Super+Shift+Arrows)
-cmd-ctrl-alt-shift-left = 'move left'
-cmd-ctrl-alt-shift-down = 'move down'
-cmd-ctrl-alt-shift-up = 'move up'
-cmd-ctrl-alt-shift-right = 'move right'
+cmd-ctrl-alt-shift-left = "exec-and-forget $HOME/.local/bin/omacosy-helper zones step-left"
+cmd-ctrl-alt-shift-down = "move-node-to-monitor --focus-follows-window down"
+cmd-ctrl-alt-shift-up = "move-node-to-monitor --focus-follows-window up"
+cmd-ctrl-alt-shift-right = "exec-and-forget $HOME/.local/bin/omacosy-helper zones step-right"
 
-# Layout (omarchy: Super+T float toggle, Super+J split toggle, Super+F fullscreen)
-cmd-ctrl-alt-t = 'layout floating tiling'
-# Keybinding cheatsheet (omarchy: Super+K) — the bar renders it from
+# Layout (omarchy: Super+T float toggle, Super+G zone toggle, Super+F fullscreen)
+cmd-ctrl-alt-t = "exec-and-forget $HOME/.local/bin/omacosy-helper zones free"
+# Keybinding cheatsheet (Super+O) — the bar renders it from
 # THIS file, so the sheet cannot drift from the keys it documents.
-cmd-ctrl-alt-k = 'exec-and-forget /usr/bin/touch /tmp/omacosy-bar-cheatsheet'
+cmd-ctrl-alt-o = 'exec-and-forget /usr/bin/touch /tmp/omacosy-bar-cheatsheet'
 
 # Floats
 # Surface the next float on this workspace (S for surface). macOS
@@ -120,17 +91,16 @@ cmd-ctrl-alt-k = 'exec-and-forget /usr/bin/touch /tmp/omacosy-bar-cheatsheet'
 # focus next and cannot be pinned on top without a private window-level
 # call; this is how you get it back, cursor and all.
 cmd-ctrl-alt-s = 'exec-and-forget $HOME/.local/bin/omacosy-float'
-# wrapper-aware: the dwindle hint's solo container makes the bare
-# commands no-op or misfire (issue #3) — omacosy-layout compensates
-cmd-ctrl-alt-j = 'exec-and-forget $HOME/.local/bin/omacosy-layout togglesplit'
-cmd-ctrl-alt-f = 'fullscreen --no-outer-gaps'
+# Cycle this workspace: quarter/half/quarter -> thirds -> four quarters.
+cmd-ctrl-alt-g = "exec-and-forget $HOME/.local/bin/omacosy-helper zones toggle"
+cmd-ctrl-alt-f = "exec-and-forget $HOME/.local/bin/omacosy-helper zones maximize"
 # native (green-button) fullscreen: the only mode that may claim the
 # notch strip on the built-in display; deliberate enter/exit only
 cmd-ctrl-alt-n = 'macos-native-fullscreen'
 
-# Resize (omarchy: Super+Minus / Super+Equal)
-cmd-ctrl-alt-minus = 'exec-and-forget $HOME/.local/bin/omacosy-layout resize -50'
-cmd-ctrl-alt-equal = 'exec-and-forget $HOME/.local/bin/omacosy-layout resize +50'
+# Whole-layout resize: Minus = thirds; Equal = quarter/half/quarter.
+cmd-ctrl-alt-minus = "exec-and-forget $HOME/.local/bin/omacosy-helper zones thirds"
+cmd-ctrl-alt-equal = "exec-and-forget $HOME/.local/bin/omacosy-helper zones half"
 
 # Workspaces (omarchy: Super+N, Super+Shift+N, Super+Tab)
 cmd-ctrl-alt-1 = 'exec-and-forget $HOME/.local/bin/omacosy-ws 1'
@@ -201,7 +171,7 @@ cmd-ctrl-alt-shift-t = 'exec-and-forget $HOME/.local/bin/theme-next'
 cmd-ctrl-alt-shift-b = 'exec-and-forget $HOME/.local/bin/theme-bg-next'
 
 # Modes
-cmd-ctrl-alt-r = 'mode resize'
+cmd-ctrl-alt-r = "exec-and-forget $HOME/.local/bin/omacosy-helper zones sync"
 cmd-ctrl-alt-shift-semicolon = 'mode service'
 
 [mode.resize.binding]
@@ -217,7 +187,7 @@ esc = 'mode main'
 [mode.service.binding]
 esc = ['reload-config', 'mode main']
 r = ['flatten-workspace-tree', 'mode main']  # reset layout
-backspace = ['close-all-windows-but-current', 'mode main']
+# No close-all-other-windows binding.
 
 # Independent NINE workspaces per display, omarchy-style: the main
 # display owns 1-9, the secondary owns 11-19 (same LAST digit = same
@@ -225,21 +195,21 @@ backspace = ['close-all-windows-but-current', 'mode main']
 # monitor-aware via omacosy-ws. On a single display the secondary set
 # falls back to main and just sits empty.
 [workspace-to-monitor-force-assignment]
-1 = ['main']
-2 = ['main']
-3 = ['main']
-4 = ['main']
-5 = ['main']
-6 = ['main']
-7 = ['main']
-8 = ['main']
-9 = ['main']
-11 = ['secondary', 'main']
-12 = ['secondary', 'main']
-13 = ['secondary', 'main']
-14 = ['secondary', 'main']
-15 = ['secondary', 'main']
-16 = ['secondary', 'main']
-17 = ['secondary', 'main']
-18 = ['secondary', 'main']
-19 = ['secondary', 'main']
+1 = ['built-in', 'main']
+2 = ['built-in', 'main']
+3 = ['built-in', 'main']
+4 = ['built-in', 'main']
+5 = ['built-in', 'main']
+6 = ['built-in', 'main']
+7 = ['built-in', 'main']
+8 = ['built-in', 'main']
+9 = ['built-in', 'main']
+11 = ['C49RG9', 'built-in', 'main']
+12 = ['C49RG9', 'built-in', 'main']
+13 = ['C49RG9', 'built-in', 'main']
+14 = ['C49RG9', 'built-in', 'main']
+15 = ['C49RG9', 'built-in', 'main']
+16 = ['C49RG9', 'built-in', 'main']
+17 = ['C49RG9', 'built-in', 'main']
+18 = ['C49RG9', 'built-in', 'main']
+19 = ['C49RG9', 'built-in', 'main']

@@ -162,6 +162,7 @@ func focusWorkspace(_ ws: String) {
     if omniwmActive() {
         omniwmctl(["workspace", "focus-name", ws])
     } else {
+        try? Data(ws.utf8).write(to: URL(fileURLWithPath: "/tmp/omacosy-user-intent-\(getuid())"), options: .atomic)
         aerospace(["workspace", ws])
     }
 }
@@ -365,6 +366,56 @@ final class Model {
     var occupied: Set<String> = []
     var frontApp = ""
     var media = Media()
+    var windowTitles: [WindowTitle] = []
+    var focusedWindowID = 0
+}
+
+struct WindowTitle: Equatable {
+    let id: Int
+    let workspace: String
+    let title: String
+    let appName: String
+}
+
+// Every managed window appears in the same ascending-ID order as the cycle
+// command, including singletons and windows without a document title.
+func workspaceWindowTitles(from rows: [[String: Any]]) -> [WindowTitle] {
+    rows.compactMap { row -> WindowTitle? in
+        guard let id = row["window-id"] as? Int,
+              let workspace = row["workspace"] as? String else { return nil }
+        let app = row["app-name"] as? String ?? ""
+        let title = (row["window-title"] as? String ?? "")
+            .components(separatedBy: .controlCharacters).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return WindowTitle(id: id, workspace: workspace,
+                           title: title.isEmpty ? "\(app.isEmpty ? "Window" : app) \(id)" : title,
+                           appName: app)
+    }.sorted { $0.id < $1.id }
+}
+
+// One queue owns WM snapshot reads, including titles. Independent readers
+// cancel AeroSpace's refresh sessions against each other during app startup;
+// reproduced with IINA disappearing from the model and Edge regaining focus.
+let rebuildQueue = DispatchQueue(label: "com.omacosy.bar.rebuild")
+var windowTitleRefreshRunning = false
+func refreshWindowTitles() {
+    guard !windowTitleRefreshRunning else { return }
+    windowTitleRefreshRunning = true
+    rebuildQueue.async {
+        let text = aerospace(["list-windows", "--all", "--format", "%{window-id} %{app-bundle-id} %{app-name} %{workspace} %{window-title}", "--json"])
+        let rows = text.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [[String: Any]]
+        let titles = workspaceWindowTitles(from: rows ?? [])
+        let focused = Int(aerospace(["list-windows", "--focused", "--format", "%{window-id}"]).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        DispatchQueue.main.async {
+            windowTitleRefreshRunning = false
+            guard rows != nil else { return }
+            if titles != model.windowTitles || focused != model.focusedWindowID {
+                model.windowTitles = titles
+                model.focusedWindowID = focused
+                repaint()
+            }
+        }
+    }
 }
 
 struct Media: Equatable {
@@ -391,14 +442,13 @@ struct Snapshot {
     var focused = "" // omniwm only — under aerospace the fast path owns it
 }
 
-let rebuildQueue = DispatchQueue(label: "com.omacosy.bar.rebuild")
-
 func fetchSnapshot() -> Snapshot {
     omniwmActive() ? omniwmSnapshot() : aerospaceSnapshot()
 }
 
 func aerospaceSnapshot() -> Snapshot {
     var s = Snapshot()
+    let singleDisplay = surfaces.count == 1
     // ONE call for every monitor's set and which of them is visible: the
     // old loop spent two subprocesses per display, so docking doubled it
     // to four and the rebuild grew with the display count — on a path a
@@ -410,6 +460,8 @@ func aerospaceSnapshot() -> Snapshot {
         .split(separator: "\n") {
         let f = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard f.count >= 3 else { continue }
+        // Keep full IDs until occupancy is known. A guest can remain occupied
+        // when all nine primary workspaces were in use during unplugging.
         sets[f[1], default: []].append(f[0])
         if f[2] == "true" { visible[f[1]] = f[0] }
     }
@@ -423,8 +475,8 @@ func aerospaceSnapshot() -> Snapshot {
                            "%{workspace}|%{app-name}|%{window-layout}"]).split(separator: "\n") {
         let f = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
         guard f.count >= 3 else { continue }
+        s.occupied.insert(f[0]) // Zone-managed floating windows count as occupied too.
         guard f[2] != "floating" else { continue }
-        s.occupied.insert(f[0])
         if let existing = sole[f[0]] {
             if existing != f[1] { count[f[0]] = 2 }
         } else {
@@ -433,6 +485,14 @@ func aerospaceSnapshot() -> Snapshot {
         }
     }
     s.soleApp = sole.filter { count[$0.key] == 1 }
+    if singleDisplay {
+        let focused = aerospace(["list-windows", "--focused", "--format", "%{workspace}"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        for (id, (workspaces, active)) in s.perMonitor {
+            let shown = workspaces.filter { $0.count == 1 || s.occupied.contains($0) || $0 == focused }
+            s.perMonitor[id] = (shown, shown.contains(focused) ? focused : active)
+        }
+    }
     return s
 }
 
@@ -2187,7 +2247,6 @@ func karabinerExecCheatEntries() -> [CheatEntry] {
     return entries
 }
 
-let cheatColumns = 3
 let cheatRowH: CGFloat = 20
 let cheatPad: CGFloat = 18
 
@@ -2200,6 +2259,7 @@ final class CheatWindow: NSWindow {
 }
 
 final class CheatsheetView: NSView {
+    var availableFrame = NSRect(x: 0, y: 0, width: 1000, height: 700)
     var entries: [CheatEntry] = []
     var filter = ""
     private var keyFont: NSFont { nerdFont("Bold", 12) }
@@ -2233,6 +2293,7 @@ final class CheatsheetView: NSView {
     private func columns() -> [[(String?, CheatEntry?)]] {
         let all = rows()
         guard !all.isEmpty else { return [] }
+        let cheatColumns = max(1, min(3, Int(availableFrame.width / 850)))
         let per = Int((Double(all.count) / Double(cheatColumns)).rounded(.up))
         return stride(from: 0, to: all.count, by: per).map {
             Array(all[$0..<min($0 + per, all.count)])
@@ -2259,7 +2320,7 @@ final class CheatsheetView: NSView {
         let widths = columnWidths()
         let w = widths.reduce(0) { $0 + $1.total } + CGFloat(cols.count - 1) * 28
         let tallest = cols.map(\.count).max() ?? 0
-        return NSSize(width: w + cheatPad * 2,
+        return NSSize(width: max(640, w + cheatPad * 2),
                       height: CGFloat(tallest) * cheatRowH + cheatPad * 2 + 26)
     }
 
@@ -2273,7 +2334,7 @@ final class CheatsheetView: NSView {
         body.stroke()
 
         let title = filter.isEmpty
-            ? "keybindings — Super is Caps Lock · type to search · Super+K, Esc or click to close"
+            ? "Shortcuts · Super = Caps Lock · type to search · Caps+O or Esc closes"
             : "search: \(filter)▏ — \(visibleEntries().count) match\(visibleEntries().count == 1 ? "" : "es") · Esc clears"
         drawText(title, nerdFont("Bold", 12), palette.accent.withAlphaComponent(0.8),
                  leftAt: cheatPad, midY: bounds.maxY - cheatPad - 6)
@@ -2305,8 +2366,8 @@ final class CheatsheetView: NSView {
             if filter.isEmpty { hideCheatsheet() } else { filter = ""; refit() }
         case 51: // backspace
             if !filter.isEmpty { filter.removeLast(); refit() }
-        case 40 where event.modifierFlags.contains([.command, .control, .option]):
-            hideCheatsheet() // Super+K toggles closed even while we hold key
+        case 31 where event.modifierFlags.contains([.command, .control, .option]):
+            hideCheatsheet() // Caps+O also closes while the sheet holds key
         default:
             guard let chars = event.charactersIgnoringModifiers,
                 !chars.isEmpty,
@@ -2318,16 +2379,22 @@ final class CheatsheetView: NSView {
         }
     }
 
-    // the sheet shrinks to its matches — re-measure and keep the centre
+    // Keep the viewport on this display; the document may scroll vertically.
     private func refit() {
-        guard let window = window else { needsDisplay = true; return }
-        let size = measure()
-        let c = NSPoint(x: window.frame.midX, y: window.frame.midY)
-        frame = NSRect(origin: .zero, size: size)
-        window.setFrame(NSRect(x: c.x - size.width / 2, y: c.y - size.height / 2,
-                               width: size.width, height: size.height), display: true)
+        guard let window, let scroll = enclosingScrollView else { needsDisplay = true; return }
+        let content = measure()
+        let viewport = NSSize(width: min(content.width + 16, availableFrame.width),
+                              height: min(content.height, availableFrame.height))
+        frame = NSRect(origin: .zero, size: content)
+        window.setFrame(NSRect(x: availableFrame.midX - viewport.width / 2,
+                               y: availableFrame.midY - viewport.height / 2,
+                               width: viewport.width, height: viewport.height), display: true)
+        scroll.frame = NSRect(origin: .zero, size: viewport)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, content.height - scroll.contentSize.height)))
+        scroll.reflectScrolledClipView(scroll.contentView)
         needsDisplay = true
     }
+
 }
 
 var cheatWindow: CheatWindow?
@@ -2348,25 +2415,37 @@ func toggleCheatsheet() {
         tlog("cheatsheet: no bindings parsed from \(omniwmActive() ? "omniwm settings.toml" : "aerospace.toml")")
         return
     }
+    let mouse = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main!
+    var available = screen.visibleFrame.insetBy(dx: 20, dy: 20)
+    available.size.height = min(available.height, screen.frame.maxY - barHeight - 20 - available.minY)
     let view = CheatsheetView(frame: .zero)
+    view.availableFrame = available
     view.entries = entries
     let size = view.measure()
     view.frame = NSRect(origin: .zero, size: size)
-    // centred on the display holding the cursor, like every other
-    // full-surface thing here
-    let mouse = NSEvent.mouseLocation
-    let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main!
+    let viewport = NSSize(width: min(size.width + 16, available.width), height: min(size.height, available.height))
     let window = CheatWindow(
-        contentRect: NSRect(x: screen.frame.midX - size.width / 2,
-                            y: screen.frame.midY - size.height / 2,
-                            width: size.width, height: size.height),
+        contentRect: NSRect(x: available.midX - viewport.width / 2,
+                            y: available.midY - viewport.height / 2,
+                            width: viewport.width, height: viewport.height),
         styleMask: .borderless, backing: .buffered, defer: false)
     window.isOpaque = false
     window.backgroundColor = .clear
     window.hasShadow = true
     window.level = .popUpMenu
     window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-    window.contentView = view
+    let scroll = NSScrollView(frame: NSRect(origin: .zero, size: viewport))
+    scroll.hasVerticalScroller = true
+    scroll.hasHorizontalScroller = true
+    scroll.autohidesScrollers = true
+    scroll.drawsBackground = true
+    scroll.backgroundColor = palette.barBG
+    scroll.autoresizingMask = [.width, .height]
+    scroll.documentView = view
+    window.contentView = scroll
+    scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, size.height - scroll.contentSize.height)))
+    scroll.reflectScrolledClipView(scroll.contentView)
     // take key so typing filters — remember the app that had focus, the
     // close path activates it again
     cheatPrevApp = NSWorkspace.shared.frontmostApplication
@@ -2444,13 +2523,13 @@ func appIcon(_ name: String) -> NSImage? {
 }
 
 let barHeight: CGFloat = 34
-let padLeft: CGFloat = 10
+let padLeft: CGFloat = 0
 let chipBox: CGFloat = 20
-let chipPad: CGFloat = 2
-let pillHeight: CGFloat = 26
-let chipPillHeight: CGFloat = 20
-let radius: CGFloat = 4
-let gap: CGFloat = 14
+let chipPad: CGFloat = 0
+let pillHeight: CGFloat = 34
+let chipPillHeight: CGFloat = 34
+let radius: CGFloat = 0
+let gap: CGFloat = 0
 
 // The terminal the activity pill opens btop in. install.sh writes the
 // RESOLVED choice (apps.local.conf overrides already applied) next to the
@@ -2467,11 +2546,15 @@ let terminalApp: String = {
     return "Ghostty"
 }()
 
+let btopBin = ["/opt/homebrew/bin/btop", "/usr/local/bin/btop"]
+    .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "btop"
+
 final class BarView: NSView {
     weak var surface: BarSurface?
     var chipRects: [(String, NSRect)] = []
     var itemRects: [(String, NSRect)] = []
     var mediaRects: [(String, NSRect)] = []
+    var windowTitleRects: [(Int, NSRect)] = []
     var appleRect: NSRect = .zero
 
     override var isFlipped: Bool { false }
@@ -2520,7 +2603,7 @@ final class BarView: NSView {
         guard model.media.running, !model.media.title.isEmpty else { return }
         let width = mediaSize(titleFont, iconFont)
         let pill = NSRect(x: origin, y: (barHeight - pillHeight) / 2, width: width, height: pillHeight)
-        palette.itemBG.setFill()
+        palette.barBG.withAlphaComponent(1).setFill()
         NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
 
         let layout = mediaLayout(titleFont, iconFont)
@@ -2540,25 +2623,25 @@ final class BarView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        palette.barBG.withAlphaComponent(1).setFill()
+        bounds.fill()
         chipRects.removeAll()
+        windowTitleRects.removeAll()
+        removeAllToolTips()
         itemRects.removeAll()
         mediaRects.removeAll()
         let chipFont = nerdFont("SemiBold", 13)
-        let appFont = nerdFont("Bold", 13)
         let iconFont = nerdFont("Bold", 14)
         guard let surface else { return }
 
-        // workspace chips, in one bracket — this display's set only.
-        // Undocked, force-assignment parks the GUEST set (11-19) on the
-        // single display, where its empty slots would render as
-        // duplicate digits — so they are hidden and an empty primary
-        // keeps its slot to hold the row at 1..9. Docked, this
-        // surface's list IS its own set: every slot belongs on the row,
-        // and filtering left the laptop showing two lonely icons.
-        let shown = surfaces.count > 1 ? surface.workspaces
-            : surface.workspaces.filter {
-                $0.count == 1 || model.occupied.contains($0) || $0 == model.focused
-            }
+        // Keep four local slots visible; reveal higher slots only when in use.
+        // Undocked, do not duplicate the external display's empty guest slots.
+        let shown = surface.workspaces.filter { ws in
+            let slot = Int(ws.suffix(1)) ?? 0
+            let primary = surfaces.count > 1 || ws.count == 1
+            return (primary && (1...4).contains(slot))
+                || model.occupied.contains(ws) || ws == surface.visible || ws == model.focused
+        }
         // apple pill: the system menu the hidden native menu bar carried
         let appleGlyph = "\u{f179}"
         let appleFont = nerdFont("Bold", 15)
@@ -2566,15 +2649,15 @@ final class BarView: NSView {
         // edge stays at padLeft, so only the inner edge moves.
         let appleW = pillHeight
         let apple = NSRect(x: padLeft, y: (barHeight - pillHeight) / 2, width: appleW, height: pillHeight)
-        palette.itemBG.setFill()
+        palette.barBG.withAlphaComponent(1).setFill()
         NSBezierPath(roundedRect: apple, xRadius: radius, yRadius: radius).fill()
         drawIcon(appleGlyph, appleFont, palette.accent, centeredIn: apple)
         appleRect = NSRect(x: apple.minX, y: 0, width: appleW, height: barHeight)
 
         let bracketW = CGFloat(shown.count) * (chipBox + chipPad * 2)
-        let bracket = NSRect(x: apple.maxX + 10, y: (barHeight - pillHeight) / 2,
+        let bracket = NSRect(x: apple.maxX, y: (barHeight - pillHeight) / 2,
                              width: bracketW, height: pillHeight)
-        palette.itemBG.setFill()
+        palette.barBG.withAlphaComponent(1).setFill()
         NSBezierPath(roundedRect: bracket, xRadius: radius, yRadius: radius).fill()
 
         var x = bracket.minX
@@ -2588,10 +2671,10 @@ final class BarView: NSView {
             if ws == surface.visible {
                 let pill = NSRect(x: box.minX, y: (barHeight - chipPillHeight) / 2,
                                   width: chipBox, height: chipPillHeight)
-                palette.accent.setFill()
+                palette.barBG.withAlphaComponent(1).setFill()
                 NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
             }
-            let tint: NSColor = ws == surface.visible ? palette.barBG : palette.muted
+            let tint: NSColor = ws == surface.visible ? palette.accent : palette.muted
             switch workspaceIconConfig.icon(for: ws) {
             case .some(.glyph(let glyph)):
                 drawIcon(glyph, iconFont, tint, centeredIn: box)
@@ -2601,26 +2684,16 @@ final class BarView: NSView {
                 if let app = model.soleApp[ws], let icon = appIcon(app) {
                     icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
                 } else {
-                    draw(String(ws.suffix(1)), chipFont, tint, centeredIn: box)
+                    draw(surfaces.count == 1 ? ws : String(ws.suffix(1)), chipFont, tint, centeredIn: box)
                 }
             }
             chipRects.append((ws, slot))
             x += chipBox + chipPad * 2
         }
 
-        // front-app pill — clickable: it drops the app's real menus
-        var leftEdge = bracket.maxX
+        // Reserve this space for session titles; app-name badges are hidden.
+        let leftEdge = bracket.maxX
         appPillRect = .zero
-        if !model.frontApp.isEmpty {
-            let textW = advance(model.frontApp, appFont)
-            let pill = NSRect(x: bracket.maxX + gap, y: (barHeight - pillHeight) / 2,
-                              width: textW + 20, height: pillHeight)
-            palette.itemBG.setFill()
-            NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
-            draw(model.frontApp, appFont, palette.accent, centeredIn: pill)
-            appPillRect = pill
-            leftEdge = pill.maxX
-        }
 
         // media: centred where there is room, in the left cluster where a
         // notch owns the middle
@@ -2653,7 +2726,7 @@ final class BarView: NSView {
             let width = square ? pillHeight : 10 + iconInk + innerGap + labelAdv + 10
             let pill = NSRect(x: cursor - width, y: (barHeight - pillHeight) / 2,
                               width: width, height: pillHeight)
-            palette.itemBG.setFill()
+            palette.barBG.withAlphaComponent(1).setFill()
             NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
             if hasIcon {
                 drawIcon(item.icon, iconFont, iconColor,
@@ -2667,6 +2740,39 @@ final class BarView: NSView {
             }
             itemRects.append((name, NSRect(x: pill.minX, y: 0, width: width, height: barHeight)))
             cursor = pill.minX - gap
+        }
+
+        // Persistent window titles occupy only unused bar space, never the notch.
+        let windowTitles = model.windowTitles.filter { $0.workspace == surface.visible }
+        let start = leftEdge + gap + (surface.notched && mediaW > 0 ? mediaW + gap : 0)
+        var end = cursor
+        if surface.notched {
+            end = min(end, surface.screen.auxiliaryTopLeftArea?.width ?? (bounds.width / 2 - 100))
+        } else if mediaW > 0 {
+            end = min(end, (bounds.width - mediaW) / 2 - gap)
+        }
+        if !windowTitles.isEmpty, end > start + 24 {
+            let width = min(260, (end - start) / CGFloat(windowTitles.count))
+            if width > 12 {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineBreakMode = .byTruncatingMiddle
+                for (index, terminal) in windowTitles.enumerated() {
+                    let box = NSRect(x: start + CGFloat(index) * width, y: (barHeight - pillHeight) / 2, width: width, height: pillHeight)
+                    let active = terminal.id == model.focusedWindowID
+                    palette.barBG.withAlphaComponent(1).setFill()
+                    NSBezierPath(roundedRect: box, xRadius: radius, yRadius: radius).fill()
+                    let icon = appIcon(terminal.appName)
+                    let iconWidth: CGFloat = icon != nil && box.width >= 48 ? 20 : 0
+                    if iconWidth > 0 {
+                        icon?.draw(in: NSRect(x: box.minX + 4, y: box.midY - 8, width: 16, height: 16))
+                    }
+                    let title = "\(index + 1) \(terminal.title)"
+                    (title as NSString).draw(in: NSRect(x: box.minX + 6 + iconWidth, y: box.midY - 8, width: max(0, box.width - 12 - iconWidth), height: 17), withAttributes: [
+                        .font: nerdFont("SemiBold", 12), .foregroundColor: active ? palette.accent : palette.muted, .paragraphStyle: paragraph])
+                    windowTitleRects.append((terminal.id, box))
+                    addToolTip(box, owner: terminal.title as NSString, userData: nil)
+                }
+            }
         }
     }
 
@@ -2693,6 +2799,14 @@ final class BarView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if let target = windowTitleRects.first(where: { $0.1.contains(p) })?.0 {
+            DispatchQueue.global(qos: .userInitiated).async {
+                aerospace(["focus", "--window-id", String(target)])
+                aerospace(["move-mouse", "window-lazy-center"])
+                DispatchQueue.main.async { refreshWindowTitles() }
+            }
+            return
+        }
         if appPillRect != .zero, appPillRect.contains(p), let surface {
             appMenuStack.removeAll()
             // clicking the bar deactivated the app, which makes its menu
@@ -2750,7 +2864,19 @@ final class BarView: NSView {
                 URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension")!)
         case "activity":
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = shell("/usr/bin/open", ["-na", terminalApp, "--args", "--title=omacosy-activity", "-e", "btop"])
+                // one monitor, not one per click: raise the open one instead
+                if let pid = Int32(shellOut("/usr/bin/pgrep", ["-f", "title=omacosy-activity"])
+                    .split(separator: "\n").first ?? ""),
+                   let app = NSRunningApplication(processIdentifier: pid) {
+                    app.activate()
+                    return
+                }
+                // -e goes through login(1), whose PATH has no Homebrew: a bare
+                // "btop" dies at once. Ghostty's restored-state window would
+                // otherwise ride along as an empty shell titled like this one.
+                var args = ["-na", terminalApp, "--args", "--title=omacosy-activity"]
+                if terminalApp == "Ghostty" { args.append("--window-save-state=never") }
+                _ = shell("/usr/bin/open", args + ["-e", btopBin])
             }
         default: break
         }
@@ -3004,7 +3130,7 @@ func fullscreenDisplays() -> Set<CGDirectDisplayID> {
             // ordinary tiled Arc reads as fullscreen. WIDTH is what
             // separates them — `--no-outer-gaps` means exactly that, the
             // window takes the side gaps too, and a tiled one never does.
-            if rect.origin.y - display.origin.y < inset + 3,
+            if rect.origin.y - display.origin.y < max(inset, barHeight) - 1,
                rect.height >= display.height - inset - 6,
                rect.width >= display.width - 2 {
                 covered.insert(ids[i])
@@ -3068,12 +3194,13 @@ func updateBarVisibility() {
     let covered = fullscreenDisplays()
     for surface in surfaces {
         let hide = covered.contains(screenID(surface.screen)) && !revealed
-        // unconditional either way: isVisible can desync from the window
-        // server, which is how borders.swift ended up with a stuck shroud
+        // Reordering an already-visible bar emits another window-order event.
+        // Only change visibility on transitions; otherwise our own event
+        // handler continuously reorders windows and rebuilds WM snapshots.
         if hide {
-            surface.window.orderOut(nil)
+            if surface.window.isVisible { surface.window.orderOut(nil) }
             if openPopup != nil { closePopup() }
-        } else {
+        } else if !surface.window.isVisible {
             surface.window.orderFrontRegardless()
         }
     }
@@ -3287,10 +3414,15 @@ var reconcileRetry: DispatchWorkItem?
 func anyUnresolved() -> Bool { surfaces.contains { $0.monitorID.hasPrefix("unresolved:") } }
 // the focused workspace as the manager itself reports it (blocking: off-main)
 func managerFocused(_ omni: Bool) -> String {
-    omni
-        ? ((omniQuery("workspaces", ["--focused", "--fields", "raw-name"])?["workspaces"]
+    if omni {
+        return ((omniQuery("workspaces", ["--focused", "--fields", "raw-name"])?["workspaces"]
             as? [[String: Any]])?.first?["rawName"] as? String ?? "")
-        : aerospace(["list-workspaces", "--focused"]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    let windowWorkspace = aerospace(["list-windows", "--focused", "--format", "%{workspace}"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if !windowWorkspace.isEmpty { return windowWorkspace }
+    return aerospace(["list-workspaces", "--focused"])
+        .split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
 }
 // After a switch the ring shows what the OLD manager had focused, and the
 // new one's stream can start before it answers at all. So reconcile asks the
@@ -3404,20 +3536,8 @@ func resyncIfGained() {
 // before the arrangement settles, so give it a beat (borders.swift learnt
 // the same lesson with a stale CG-to-Cocoa flip after a replug).
 //
-// This is also where the guest set gets folded and unfolded. Undocked,
-// AeroSpace parks workspaces 11-19 on the one display, and omacosy-ws
-// only ever matches single-digit slots — so anything left on a guest
-// workspace is unreachable by Super+N or Super+Tab until a display
-// comes back. omacosy-ws-collapse moves those windows into
-// 1-9 and remembers where they came from.
-//
-// It used to be driven by sketchybar's display_change.sh, which went
-// out with sketchybar; nothing has called it since, so the first undock
-// after that stranded a workspace's worth of apps. The bar is the only
-// long-lived process already watching for this, so it owns it now.
-// Guarded on the COUNT changing: this notification also fires for
-// resolution and arrangement changes, and re-folding on those would
-// shuffle windows for no reason.
+// AeroSpace hotplug moves belong to the authorised window agent. The
+// optional OmniWM backend retains its existing adapter here.
 var monitorCount = NSScreen.screens.count
 NotificationCenter.default.addObserver(
     forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -3450,6 +3570,7 @@ NotificationCenter.default.addObserver(
 // both WMs: OmniWM re-routes guest WORKSPACES on unplug but strands
 // their windows "after 9"; ws-collapse folds them into 1-9.
 func syncWorkspaceFold(_ why: String) {
+    guard omniwmActive() else { return } // AeroSpace belongs to the authorised window agent.
     let n = NSScreen.screens.count
     tlog("\(why) — running ws-collapse sync \(n)")
     // off-main: it waits for the WM (up to 30 s) and moves window by window
@@ -3471,6 +3592,7 @@ func kickRebuild() {
             let fetched = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
             DispatchQueue.main.async {
                 let t1 = DispatchTime.now().uptimeNanoseconds
+                refreshWindowTitles()
                 guard apply(snapshot) else { return } // nothing moved
                 repaint()
                 let drawn = Double(DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000
@@ -3519,16 +3641,12 @@ func kickVisibility() {
 let notify: NotifyProc = { event, _, _, _ in
     DispatchQueue.main.async {
         if event == EVENT_WINDOW_CREATE || event == EVENT_WINDOW_DESTROY {
-            kickRebuild()
             rebuildSubscriptions()
-        } else if event == EVENT_WINDOW_ORDER || event == EVENT_WINDOW_VISIBILITY {
-            // the chips are only as fresh as this: a window changing
-            // workspace shows up here and nowhere else. A plain
-            // workspace switch lands here too and fetches a snapshot
-            // that changed nothing, which apply() reports so the
-            // repaint is skipped.
-            kickRebuild()
         }
+        // The window agent publishes topology after its layout pass. Raw
+        // WindowServer events can precede AX/WM registration during launch;
+        // querying the WM here races both of those owners. Workspace moves
+        // are covered by the explicit moved signal above.
         kickVisibility()
     }
 }
@@ -3725,6 +3843,28 @@ func scheduleClock() {
 scheduleClock()
 
 Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in updateWeather() }
+// The authorised window agent publishes native AX title/focus notifications.
+// Metadata changes do not need a WM query; only topology changes rebuild it.
+DistributedNotificationCenter.default().addObserver(
+    forName: Notification.Name("com.omacosy.window-state"), object: nil, queue: .main
+) { note in
+    guard let info = note.userInfo, let kind = info["kind"] as? String else { return }
+    guard let id = info["id"] as? Int, kind == "title" || kind == "focus" else {
+        kickRebuild()
+        return
+    }
+    if let rawTitle = info["title"] as? String,
+       let index = model.windowTitles.firstIndex(where: { $0.id == id }) {
+        let old = model.windowTitles[index]
+        let title = rawTitle.components(separatedBy: .controlCharacters).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        model.windowTitles[index] = WindowTitle(id: id, workspace: old.workspace,
+            title: title.isEmpty ? "\(old.appName) \(id)" : title, appName: old.appName)
+    }
+    if kind == "focus" { model.focusedWindowID = id }
+    repaint()
+}
+refreshWindowTitles()
 
 // --- go -------------------------------------------------------------------
 

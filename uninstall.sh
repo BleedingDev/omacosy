@@ -165,13 +165,19 @@ zshrc_unstub
 # configs COPIED for TCC-protected clones are ours to delete; the
 # restore() calls below then bring back backups / displaced symlinks
 grep '^copied-config ' "$MANIFEST" 2>/dev/null | sed 's/^copied-config //' |
-  while IFS= read -r d; do rm -rf "$d"; done
+  while IFS= read -r d; do
+    case "$d" in
+      "$HOME/.config/ghostty"|"$HOME/Library/Application Support/com.mitchellh.ghostty") continue ;;
+    esac
+    rm -rf "$d"
+  done
 
 restore "$HOME/.zshrc"
 restore "$HOME/.config/starship.toml"
 restore "$HOME/.config/aerospace"
 restore "$HOME/.config/omniwm"
-restore "$HOME/.config/ghostty"
+# Ghostty configuration remains user-owned, including legacy copied-config
+# manifest entries. Uninstalling the desktop must not replace or remove it.
 
 # --- ~/.zshrc.local ---------------------------------------------------------
 # Ours to remove ONLY when we created it and it is still an exact copy of

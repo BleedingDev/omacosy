@@ -1,0 +1,28 @@
+#!/bin/bash
+# Stable identity for every Omacosy executable that uses macOS permissions.
+set -euo pipefail
+check_only=false
+if [ "${1:-}" = --check ]; then check_only=true; shift; fi
+target="${1:?usage: omacosy-sign path identifier}"
+identifier="${2:?missing code identifier}"
+[[ "$identifier" =~ ^com\.omacosy\.[a-z-]+$ ]] || exit 2
+identity_file="$HOME/.config/omacosy/signing-identity"
+if [ -f "$identity_file" ]; then
+  identity="$(cat "$identity_file")"
+  [[ "$identity" =~ ^[A-Fa-f0-9]{40}$ ]] || { echo "Invalid Omacosy signing certificate fingerprint" >&2; exit 1; }
+  security find-identity -p codesigning -v "$HOME/Library/Keychains/login.keychain-db" | grep -qi "$identity" \
+    || { echo "Omacosy signing identity is unavailable in the login keychain" >&2; exit 1; }
+  if "$check_only"; then exit 0; fi
+  requirement="identifier \"$identifier\" and certificate leaf = H\"$identity\""
+  if /usr/bin/codesign --verify --strict -R "=$requirement" "$target" 2>/dev/null; then exit 0; fi
+  /usr/bin/codesign --force --sign "$identity" --keychain "$HOME/Library/Keychains/login.keychain-db" \
+    --identifier "$identifier" --timestamp=none --requirements "=designated => $requirement" "$target"
+  /usr/bin/codesign --verify --strict -R "=$requirement" "$target"
+elif security find-identity -p codesigning -v 2>/dev/null | grep -q "Apple Development"; then
+  if "$check_only"; then exit 0; fi
+  /usr/bin/codesign --force --sign "Apple Development" --identifier "$identifier" "$target"
+  /usr/bin/codesign --verify --strict "$target"
+else
+  echo "No stable Omacosy signing identity. Configure ~/.config/omacosy/signing-identity before replacing permission-bearing binaries." >&2
+  exit 1
+fi

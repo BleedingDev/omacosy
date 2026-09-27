@@ -20,6 +20,14 @@
 wm_is_omniwm() { "$HOME/.local/bin/omacosy-omni" active >/dev/null 2>&1; }
 wm_is_omniwm && exit 0
 
+# Hooks are asynchronous. An old hook must never reverse a later user's
+# switch, and an unplugged guest marked visible is not the focused workspace.
+CURRENT=$(/opt/homebrew/bin/aerospace list-windows --focused --format '%{workspace}' 2>/dev/null)
+if [ -z "$CURRENT" ]; then
+  CURRENT=$(/opt/homebrew/bin/aerospace list-workspaces --focused 2>/dev/null | head -1)
+fi
+[ -n "$CURRENT" ] && [ "$CURRENT" = "$AEROSPACE_FOCUSED_WORKSPACE" ] || exit 0
+
 U=$(id -u)
 BOUNCE="/tmp/omacosy-guard-bounce-$U"
 INTENT="/tmp/omacosy-user-intent-$U"
@@ -45,6 +53,10 @@ fi
 
 if [ -f "$INTENT" ]; then
   AGE=$(($(date +%s) - $(stat -f %m "$INTENT")))
+  REQUESTED=$(cat "$INTENT" 2>/dev/null)
+  # A concrete target survives a slow app/window response. Generic hover
+  # intent still gets only the short grace; it cannot authorise another jump.
+  [ "$REQUESTED" = "$CURRENT" ] && [ "$AGE" -le 15 ] && exit 0
   [ "$AGE" -le 2 ] && exit 0
 fi
 

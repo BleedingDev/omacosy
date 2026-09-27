@@ -306,9 +306,8 @@ log "Linking configs"
 zshrc_setup "$REPO_DIR"
 link "$REPO_DIR/config/starship.toml" "$HOME/.config/starship.toml"
 link "$REPO_DIR/config/aerospace"    "$HOME/.config/aerospace"
-# ghostty reads this AND its Application Support config, so personal
-# settings there survive
-link "$REPO_DIR/config/ghostty"      "$HOME/.config/ghostty"
+# Ghostty owns both of its config locations and its native quick-terminal
+# shortcut. Installing or updating the desktop must not replace either one.
 # OmniWM trial (this branch): settings are canonical TOML, live-reloaded
 link "$REPO_DIR/config/omniwm"       "$HOME/.config/omniwm"
 
@@ -342,9 +341,10 @@ mkdir -p "$HOME/.local/bin"
 # tiny compiled helper (cursor position, wallpaper) — replaces the
 # cliclick and desktoppr dependencies; swiftc ships with the CLT that
 # Homebrew already requires
-if [ ! -x "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/main.swift" -nt "$HOME/.local/bin/omacosy-helper" ]; then
+"$REPO_DIR/bin/omacosy-sign" --check "$HOME/.local/bin/omacosy-helper" com.omacosy.helper
+if [ ! -x "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/main.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/zones.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/pins.swift" -nt "$HOME/.local/bin/omacosy-helper" ]; then
   log "Building omacosy-helper"
-  swiftc -O -F /System/Library/PrivateFrameworks -framework DisplayServices -o "$HOME/.local/bin/omacosy-helper" "$REPO_DIR/helper/main.swift"
+  swiftc -O -F /System/Library/PrivateFrameworks -framework DisplayServices -o "$HOME/.local/bin/omacosy-helper" "$REPO_DIR/helper/main.swift" "$REPO_DIR/helper/zones.swift" "$REPO_DIR/helper/pins.swift"
 fi
 
 # workspace overview overlay (4-finger swipe up)
@@ -394,9 +394,16 @@ rm -f "$HOME/Library/LaunchAgents/com.omacosy.dwindle.plist" "$HOME/.local/bin/o
 
 # focus-follows-mouse daemon (own binary so helper rebuilds never
 # invalidate its Accessibility grant); runs as a launchd agent
-if [ ! -x "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/ffm.swift" -nt "$HOME/.local/bin/omacosy-ffm" ]; then
+# Keep workspace activation on the requested display even when an app has
+# a different main window on another workspace.
+# Native Desktop consolidation on display disconnect (macOS Tahoe bridge).
+if [ ! -x "$HOME/.local/bin/omacosy-native-spaces" ] || [ "$REPO_DIR/helper/native-spaces.m" -nt "$HOME/.local/bin/omacosy-native-spaces" ]; then
+  clang -fobjc-arc -O2 -framework AppKit -F /System/Library/PrivateFrameworks -framework SkyLight "$REPO_DIR/helper/native-spaces.m" -o "$HOME/.local/bin/omacosy-native-spaces"
+fi
+
+if [ ! -x "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/ffm.swift" -nt "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/window-lifecycle.swift" -nt "$HOME/.local/bin/omacosy-ffm" ]; then
   log "Building omacosy-ffm (grant Accessibility when prompted)"
-  swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-ffm" "$REPO_DIR/helper/ffm.swift"
+  swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-ffm" "$REPO_DIR/helper/ffm.swift" "$REPO_DIR/helper/window-lifecycle.swift"
 fi
 
 # focused-window border ring (replaces JankyBorders; no permissions;
@@ -405,23 +412,12 @@ if [ ! -x "$HOME/.local/bin/omacosy-borders" ] || [ "$REPO_DIR/helper/borders.sw
   log "Building omacosy-borders"
   swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-borders" "$REPO_DIR/helper/borders.swift"
 fi
-# stable code identity so TCC grants survive rebuilds (skipped when no
-# signing identity is present — then re-grant after each rebuild)
-if security find-identity -p codesigning -v 2>/dev/null | grep -q "Apple Development"; then
-  codesign -f -s "Apple Development" --identifier com.omacosy.helper "$HOME/.local/bin/omacosy-helper" 2>/dev/null || true
-  codesign -f -s "Apple Development" --identifier com.omacosy.ffm "$HOME/.local/bin/omacosy-ffm" 2>/dev/null || true
-  codesign -f -s "Apple Development" --identifier com.omacosy.borders "$HOME/.local/bin/omacosy-borders" 2>/dev/null || true
-  # the BUNDLE is signed now; the identifier is what grants key on
-  codesign -f -s "Apple Development" --identifier com.omacosy.bar "$BAR_APP" 2>/dev/null || true
-  codesign -f -s "Apple Development" --identifier com.omacosy.overview "$HOME/.local/bin/omacosy-overview" 2>/dev/null || true
-else
-  log "NOTE: no Apple Development signing identity found."
-  log "  macOS ties permission grants to the binary's signature — without a"
-  log "  stable identity, every rebuild (each install.sh re-run) invalidates"
-  log "  the Accessibility/Bluetooth grants and you must re-add them in"
-  log "  System Settings > Privacy & Security. Free fix: Xcode > Settings >"
-  log "  Accounts > Manage Certificates > + > Apple Development, then re-run."
-fi
+# One signing policy for CLI helpers and the bar; local identities must cover
+# the zone helper too. Never silently install an ad-hoc replacement.
+for component in helper ffm borders overview native-spaces; do
+  "$REPO_DIR/bin/omacosy-sign" "$HOME/.local/bin/omacosy-$component" "com.omacosy.$component"
+done
+"$REPO_DIR/bin/omacosy-sign" "$BAR_APP" com.omacosy.bar
 # (omacosy-gesture is signed in section 5, right after its build —
 # the makefile re-signs ad-hoc as part of the build, so signing here
 # would be overwritten and every rebuild would invalidate the

@@ -1,10 +1,9 @@
 // omacosy-ffm — focus follows mouse for the omacosy tiling setup.
 // Event-driven: a global mouseMoved monitor (rides the Accessibility
 // grant this binary needs anyway) hit-tests the topmost normal window
-// under the cursor and focuses it via SLPS + the Accessibility API.
-// Floats stay in front — a window covered by one is focused WITHOUT
-// raise (kCPSNoWindows), and a parked cursor generates no events, so
-// it can never steal focus from a launching window.
+// under the cursor and focuses its exact window ID via SkyLight key-window events.
+// Hover changes the key window without raising it. A parked cursor
+// generates no events and cannot steal focus from a launching window.
 //
 // Deliberately boring: no focus changes while any mouse button is down
 // (drags deliver mouseDragged, not mouseMoved), a ~100ms dwell before
@@ -25,31 +24,57 @@ func SLPSSetFrontProcess(_ psn: inout PSN, _ wid: UInt32, _ mode: UInt32) -> Int
 @_silgen_name("SLPSPostEventRecordTo")
 func SLPSPostEvent(_ psn: inout PSN, _ bytes: UnsafeMutablePointer<UInt8>) -> Int32
 
-let kCPSUserGenerated: UInt32 = 0x200
-let kCPSNoWindows: UInt32 = 0x400
+@_silgen_name("_AXUIElementGetWindow")
+func AXWindowID(_ element: AXUIElement, _ wid: UnsafeMutablePointer<UInt32>) -> AXError
 
-// `raise: false` — activate the process WITHOUT bringing its windows
-// forward (kCPSNoWindows, yabai's focus-without-raise recipe). Plain
-// activation reorders z on its own, so skipping only the AXRaise was
-// not enough: the SLPS call itself was still lifting tiles over
-// floating windows.
-func slpsFocus(pid: pid_t, wid: UInt32, raise: Bool) {
+let kCPSUserGenerated: UInt32 = 0x200
+
+// Use the window-ID key-event path used by yabai's no-raise focus.
+// AXMain writes and ordinary app activation can reorder windows. Neither
+// belongs on the hover path. Source: koekeishiya/yabai, window_manager.c.
+func slpsFocus(pid: pid_t, wid: UInt32) -> Bool {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.2)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+          let windows = value as? [AXUIElement], windows.contains(where: {
+              var id: UInt32 = 0
+              return AXWindowID($0, &id) == .success && id == wid
+          }) else { return false }
     var psn = PSN()
-    guard GetProcessForPID(pid, &psn) == noErr else { return }
-    let mode = raise ? kCPSUserGenerated : kCPSUserGenerated | kCPSNoWindows
-    _ = SLPSSetFrontProcess(&psn, wid, mode)
-    var w = wid
+    guard GetProcessForPID(pid, &psn) == noErr else { return false }
     var bytes = [UInt8](repeating: 0, count: 0xf8)
-    bytes[0x04] = 0xf8
-    bytes[0x3a] = 0x10
-    withUnsafeBytes(of: &w) { src in
-        for i in 0..<4 { bytes[0x3c + i] = src[i] }
+    func select(_ id: UInt32) {
+        var id = id
+        withUnsafeBytes(of: &id) { src in
+            for i in 0..<4 { bytes[0x3c + i] = src[i] }
+        }
     }
+    // Two windows in one process need an explicit key-window handoff.
+    if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+       AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
+       let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
+        var old: UInt32 = 0
+        if AXWindowID(value as! AXUIElement, &old) == .success, old != wid {
+            bytes[0x04] = 0xf8; bytes[0x08] = 0x0d; bytes[0x8a] = 0x02
+            select(old)
+            bytes.withUnsafeMutableBufferPointer { _ = SLPSPostEvent(&psn, $0.baseAddress!) }
+            usleep(40_000) // The native key handoff requires distinct events.
+            bytes[0x8a] = 0x01
+            select(wid)
+            bytes.withUnsafeMutableBufferPointer { _ = SLPSPostEvent(&psn, $0.baseAddress!) }
+        }
+    }
+    guard SLPSSetFrontProcess(&psn, wid, kCPSUserGenerated) == 0 else { return false }
+    bytes = [UInt8](repeating: 0, count: 0xf8)
+    bytes[0x04] = 0xf8; bytes[0x3a] = 0x10
+    select(wid)
     for i in 0x20..<0x30 { bytes[i] = 0xff }
     bytes[0x08] = 0x01
-    bytes.withUnsafeMutableBufferPointer { _ = SLPSPostEvent(&psn, $0.baseAddress!) }
+    let down = bytes.withUnsafeMutableBufferPointer { SLPSPostEvent(&psn, $0.baseAddress!) }
     bytes[0x08] = 0x02
-    bytes.withUnsafeMutableBufferPointer { _ = SLPSPostEvent(&psn, $0.baseAddress!) }
+    let up = bytes.withUnsafeMutableBufferPointer { SLPSPostEvent(&psn, $0.baseAddress!) }
+    return down == 0 && up == 0
 }
 
 // Apps that hover must never focus (omarchy's JetBrains-style
@@ -85,6 +110,34 @@ func displayBounds() -> [CGRect] {
     var n: UInt32 = 0
     guard CGGetActiveDisplayList(8, &ids, &n) == .success else { return [] }
     return (0..<Int(n)).map { CGDisplayBounds(ids[$0]) }
+}
+
+// Only a display-sized Dock backing window above an AX-confirmed
+// fullscreen content window is transparent to hover hit-testing.
+// Ordinary Dock UI and all application panels remain blockers.
+func fullscreenBackdrop(_ owner: String, _ layer: Int, _ rect: CGRect,
+                        _ screens: [CGRect], _ windows: [[String: Any]]) -> Bool {
+    guard owner == "Dock", layer == 20, screens.contains(rect) else { return false }
+    for candidate in windows {
+        guard candidate["kCGWindowLayer"] as? Int == 0,
+              let bounds = candidate["kCGWindowBounds"] as? [String: Any],
+              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary), frame == rect,
+              let pid = candidate["kCGWindowOwnerPID"] as? pid_t,
+              let wid = candidate["kCGWindowNumber"] as? UInt32 else { continue }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.1)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let elements = value as? [AXUIElement] else { continue }
+        for element in elements {
+            var id: UInt32 = 0
+            guard AXWindowID(element, &id) == .success, id == wid else { continue }
+            var fullscreen: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, "AXFullScreen" as CFString, &fullscreen) == .success,
+               fullscreen as? Bool == true { return true }
+        }
+    }
+    return false
 }
 
 typealias Cand = (pid: pid_t, num: Int, rect: CGRect, owner: String, blocking: Bool)
@@ -125,6 +178,7 @@ func windowCandidates() -> [Cand] {
             && owner != "Window Server"
         guard layer == 0 || blocking else { continue }
         let rect = CGRect(x: x, y: y, width: wd, height: h)
+        if fullscreenBackdrop(owner, layer, rect, screens, list) { continue }
         // AeroSpace hides inactive-workspace windows mostly offscreen
         // with a sliver visible — ignore anything <30% on-screen
         let visible = screens.reduce(CGFloat(0)) { acc, scr in
@@ -139,8 +193,8 @@ func windowCandidates() -> [Cand] {
     return cands
 }
 
-func topWindowUnder(_ p: CGPoint, _ cands: [Cand]) -> (pid: pid_t, key: String, rect: CGRect, wid: UInt32, covered: Bool)? {
-    for (i, c) in cands.enumerated() {
+func topWindowUnder(_ p: CGPoint, _ cands: [Cand]) -> (pid: pid_t, key: String, rect: CGRect, wid: UInt32)? {
+    for c in cands {
         guard c.rect.contains(p) else { continue }
         // a floating panel is under the cursor: same stance as the
         // ignore list — leave focus exactly where it is rather than
@@ -149,100 +203,16 @@ func topWindowUnder(_ p: CGPoint, _ cands: [Cand]) -> (pid: pid_t, key: String, 
         // topmost window is ignore-listed: leave focus alone entirely
         // (don't fall through to the window beneath)
         if ignoredApps.contains(c.owner.lowercased()) { return nil }
-        // Anything in front of the hit that overlaps it is a floating
-        // window (tiles never overlap): raising the hit would drag it
-        // over the float. The caller then focuses WITHOUT raise, which
-        // is what keeps floats always-in-front, omarchy style. Sub-4px
-        // overlaps don't count (border / shadow slop).
-        let covered = cands[..<i].contains { f in
-            let o = f.rect.intersection(c.rect)
-            return !o.isNull && o.width > 4 && o.height > 4
-        }
-        return (c.pid, "\(c.pid):\(c.num)", c.rect, UInt32(c.num), covered)
+        return (c.pid, "\(c.pid):\(c.num)", c.rect, UInt32(c.num))
     }
     return nil
 }
 
-// Focus exactly the window our filtered hit-test chose: find the AX
-// window whose frame matches the CG rect. Never re-hit-test via AX —
-// AXUIElementCopyElementAtPosition does its own unfiltered lookup and
-// returns AeroSpace's offscreen-stashed slivers, causing focus loops.
+// Hit-testing uses filtered CG windows; focus resolves that exact window ID.
+// AX positional hit-testing can return offscreen-stashed windows.
 let debug = ProcessInfo.processInfo.environment["OMACOSY_FFM_DEBUG"] != nil
 func dbg(_ m: String) {
     if debug { FileHandle.standardError.write((m + "\n").data(using: .utf8)!) }
-}
-
-// `allowRaise: false` = the hovered window sits under a floating
-// window somewhere on screen; focus it (SLPS + AXMain make it key)
-// but leave z-order alone so the float stays in front — omarchy's
-// float layer, emulated. Raising still happens when it's visually a
-// no-op (nothing in front overlaps), which keeps the Chromium
-// focus-needs-raise workaround for plain tile-to-tile hops.
-func focus(pid: pid_t, rect: CGRect, allowRaise: Bool) {
-    let app = AXUIElementCreateApplication(pid)
-    // AX attribute reads are synchronous mach IPC with a ~6s default
-    // timeout PER CALL — hovering a beachballing app froze the whole
-    // daemon for (windows × attributes × 6s). Cap it hard.
-    AXUIElementSetMessagingTimeout(app, 0.3)
-    var matched = false
-    var winsRef: CFTypeRef?
-    if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &winsRef) == .success,
-        let wins = winsRef as? [AXUIElement] {
-        for win in wins {
-            var posRef: CFTypeRef?
-            var sizeRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef) == .success,
-                AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef) == .success
-            else { continue }
-            // These come from ANOTHER app's accessibility tree, so the
-            // type is that app's word. Swift cannot check it for us —
-            // a cast to a CoreFoundation type is unchecked and "always
-            // succeeds" — so the type ID is checked by hand, and the
-            // results are only used when AXValueGetValue says it filled
-            // them in. Ignoring that return compared a zeroed point
-            // against a real frame and silently never matched.
-            var pos = CGPoint.zero
-            var size = CGSize.zero
-            guard let posRef, let sizeRef,
-                CFGetTypeID(posRef) == AXValueGetTypeID(),
-                CFGetTypeID(sizeRef) == AXValueGetTypeID(),
-                AXValueGetValue(posRef as! AXValue, .cgPoint, &pos),
-                AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
-            else { continue }
-            dbg("  ax win pos=(\(Int(pos.x)),\(Int(pos.y))) size=(\(Int(size.width))x\(Int(size.height))) vs cg=(\(Int(rect.origin.x)),\(Int(rect.origin.y))) \(Int(rect.width))x\(Int(rect.height))")
-            if abs(pos.x - rect.origin.x) < 2, abs(pos.y - rect.origin.y) < 2,
-                abs(size.width - rect.width) < 2, abs(size.height - rect.height) < 2 {
-                // raise first — Chromium apps often ignore main/frontmost
-                // without it; z-order changes are moot BETWEEN tiles
-                // (they don't overlap), but skipped when a float is in
-                // front (allowRaise == false)
-                if allowRaise {
-                    AXUIElementPerformAction(win, kAXRaiseAction as CFString)
-                }
-                let r = AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
-                dbg("  -> matched, set main: \(r.rawValue)")
-                matched = true
-                break
-            }
-        }
-    }
-    // App-level activation raises the app's key window too, so it is
-    // gated with the raise; the SLPS focus above already moved key
-    // focus (it's the route that works even where AX no-ops).
-    if allowRaise {
-        let fr = AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-        dbg("focus pid=\(pid) matched=\(matched) frontmost=\(fr.rawValue)")
-    } else {
-        dbg("focus pid=\(pid) matched=\(matched) no-raise (float in front)")
-    }
-}
-
-guard AXIsProcessTrustedWithOptions(
-    ["AXTrustedCheckOptionPrompt": true] as CFDictionary) else {
-    FileHandle.standardError.write("omacosy-ffm: waiting for Accessibility permission…\n".data(using: .utf8)!)
-    // poll until granted, then continue
-    while !AXIsProcessTrusted() { Thread.sleep(forTimeInterval: 1) }
-    exit(2) // relaunch (launchd KeepAlive) so the grant applies cleanly
 }
 
 // Shared by motion events and the dwell confirmation: hit-test the
@@ -294,6 +264,13 @@ func process(confirmed: Bool) {
         dwellWork?.cancel()
         return
     }
+    if confirmed && hit.key != pendingKey {
+        // A dialog/player appeared after the mouse stopped. A dwell callback
+        // is not new mouse intent and must not arm focus behind that window.
+        pendingKey = ""
+        dwellWork?.cancel()
+        return
+    }
     // judge "already focused" by reality, not our own bookkeeping — a
     // silently failed focus attempt must be retried, not remembered
     let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
@@ -310,14 +287,16 @@ func process(confirmed: Bool) {
             // hover focus IS user intent (it's movement-gated), but it
             // emits no key/click CGEvent — stamp the focus guard's
             // intent file or a cross-monitor hover (focused-workspace
-            // change) gets bounced as an "app yank", warping the
-            // cursor back via aerospace's move-mouse hook
+            // change) otherwise gets bounced as an "app yank".
             FileManager.default.createFile(
                 atPath: "/tmp/omacosy-user-intent-\(getuid())", contents: nil)
-            slpsFocus(pid: hit.pid, wid: hit.wid, raise: !hit.covered)
-            focus(pid: hit.pid, rect: hit.rect, allowRaise: !hit.covered)
-            lastFocusAt = now
-            lastKey = hit.key
+            if slpsFocus(pid: hit.pid, wid: hit.wid) {
+                lastFocusAt = now
+                lastKey = hit.key
+                DistributedNotificationCenter.default().postNotificationName(
+                    Notification.Name("com.omacosy.window-state"), object: nil,
+                    userInfo: ["kind": "focus", "id": Int(hit.wid)], deliverImmediately: true)
+            }
         }
         pendingKey = ""
         return
@@ -331,27 +310,57 @@ func process(confirmed: Bool) {
     }
 }
 
-let app = NSApplication.shared
-app.setActivationPolicy(.prohibited)
-var trailArmed = false
-NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { _ in
-    let now = CFAbsoluteTimeGetCurrent()
-    if now - lastProcessAt < processMinInterval {
-        // trailing edge: a fast flick's FINAL event (the one actually
-        // over the new window) can land inside the throttle window —
-        // dropping it without a follow-up left the window unfocused
-        // until the next twitch of the mouse
-        if !trailArmed {
-            trailArmed = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + processMinInterval) {
-                trailArmed = false
-                lastProcessAt = CFAbsoluteTimeGetCurrent()
-                process(confirmed: false)
-            }
+@main
+struct OmacosyWindowAgent {
+    static func main() {
+        guard AXIsProcessTrustedWithOptions(
+            ["AXTrustedCheckOptionPrompt": true] as CFDictionary) else {
+            FileHandle.standardError.write(Data("omacosy-ffm: waiting for Accessibility permission\n".utf8))
+            while !AXIsProcessTrusted() { Thread.sleep(forTimeInterval: 1) }
+            exit(2)
         }
-        return
+        FileHandle.standardError.write(Data("omacosy-ffm: ready; no-raise focus and window lifecycle events\n".utf8))
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let windowLifecycle = WindowLifecycle()
+        windowLifecycle.start()
+        var trailingWork: DispatchWorkItem?
+        func cancelPendingFocus() {
+            pendingKey = ""
+            dwellWork?.cancel()
+            trailingWork?.cancel()
+            trailingWork = nil
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                          object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { cancelPendingFocus() }
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]) { _ in
+            cancelPendingFocus()
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { _ in
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastProcessAt < processMinInterval {
+                // trailing edge: a fast flick's FINAL event (the one actually
+                // over the new window) can land inside the throttle window —
+                // dropping it without a follow-up left the window unfocused
+                // until the next twitch of the mouse
+                if trailingWork == nil {
+                    let work = DispatchWorkItem {
+                        trailingWork = nil
+                        lastProcessAt = CFAbsoluteTimeGetCurrent()
+                        process(confirmed: false)
+                    }
+                    trailingWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + processMinInterval, execute: work)
+                }
+                return
+            }
+            trailingWork?.cancel()
+            trailingWork = nil
+            lastProcessAt = now
+            process(confirmed: false)
+        }
+        withExtendedLifetime(windowLifecycle) { app.run() }
     }
-    lastProcessAt = now
-    process(confirmed: false)
 }
-app.run()

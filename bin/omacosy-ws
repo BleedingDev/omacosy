@@ -9,13 +9,20 @@ op="${2:-switch}"
 
 pick() { # monitor-id, slot -> that monitor's workspace ending in slot
   "$A" list-workspaces --monitor "$1" \
-    | awk -v s="$2" 'substr($0, length($0)) == s { print; exit }'
+    | awk -v s="$2" '$0 == s { exact = $0 } substr($0, length($0)) == s && !fallback { fallback = $0 } END { if (exact) print exact; else if (fallback) print fallback }'
 }
 
 # A window moved between two HIDDEN workspaces changes nothing on
 # screen, so the window server has no event to give the bar and its
 # workspace icons would sit stale. Builtin redirect, no extra process.
 moved() { : > /tmp/omacosy-bar-moved; }
+
+# The activation guard needs to distinguish a deliberate workspace command
+# from an app activating a window on another workspace. This marker is the
+# only state the workspace switcher writes; there is no settle or reassert
+# loop.
+INTENT="/tmp/omacosy-user-intent-$(id -u)"
+mark_intent() { printf '%s\n' "${1:-}" > "$INTENT"; }
 
 # OmniWM path: its switch-workspace / move-to-workspace already act on
 # the focused monitor's numeric slot (per-monitor workspace model — no
@@ -50,11 +57,11 @@ mon="$("$A" list-monitors --focused --format '%{monitor-id}')"
 case "$op" in
   switch)
     ws="$(pick "$mon" "$slot")"
-    [ -n "$ws" ] && "$A" workspace "$ws"
+    [ -n "$ws" ] && { mark_intent "$ws"; "$A" workspace "$ws"; }
     ;;
   move)
     ws="$(pick "$mon" "$slot")"
-    [ -n "$ws" ] && { "$A" move-node-to-workspace --focus-follows-window "$ws"; moved; }
+    [ -n "$ws" ] && { mark_intent "$ws"; "$A" move-node-to-workspace --focus-follows-window "$ws"; moved; }
     ;;
   next | prev) # cycle within the workspaces that BELONG to this monitor
     # `aerospace workspace next` walks every workspace on the machine, so
@@ -62,24 +69,32 @@ case "$op" in
     # display the force-assignment parks the 11-19 guests here too, and
     # cycling wandered into them (prev from 1 landed on 19). Docked, a
     # monitor's set IS its own; undocked, only the primary 1-9 are home.
-    cur="$("$A" list-workspaces --focused)"
-    nmon="$("$A" list-monitors | wc -l | tr -d ' ')"
-    if [ "$nmon" = 1 ]; then
-      all="$("$A" list-workspaces --monitor "$mon" | grep -E '^[0-9]$' | tr '\n' ' ')"
-    else
-      all="$("$A" list-workspaces --monitor "$mon" | tr '\n' ' ')"
-    fi
+    cur="$("$A" list-windows --focused --format '%{workspace}' 2>/dev/null || true)"
+    [ -n "$cur" ] || cur="$("$A" list-workspaces --focused | head -1)"
+    # Occupancy, not name length, determines eligibility. Full primary slots
+    # can leave an occupied guest workspace on the laptop after unplugging.
+    all="$("$A" list-windows --monitor "$mon" --format '%{workspace}' | awk 'NF' | sort -nu | tr '\n' ' ')"
+    [ -n "$all" ] || exit 0
     target="$(printf '%s\n' $all | awk -v cur="$cur" -v dir="$op" '
       { ws[NR] = $0 }
       END {
         if (NR == 0) exit
         at = 0
         for (i = 1; i <= NR; i++) if (ws[i] == cur) at = i
-        if (at == 0) { print (dir == "prev" ? ws[NR] : ws[1]); exit }
+        if (at == 0) {
+          if (dir == "prev") {
+            for (i = NR; i > 0; i--) if (ws[i] + 0 < cur + 0) { print ws[i]; exit }
+            print ws[NR]
+          } else {
+            for (i = 1; i <= NR; i++) if (ws[i] + 0 > cur + 0) { print ws[i]; exit }
+            print ws[1]
+          }
+          exit
+        }
         i = (dir == "prev") ? (at == 1 ? NR : at - 1) : (at == NR ? 1 : at + 1)
         print ws[i]
       }')"
-    [ -n "$target" ] && "$A" workspace "$target"
+    [ -n "$target" ] && { mark_intent "$target"; "$A" workspace "$target"; }
     ;;
   throw-all) # EVERY window of the focused workspace to the twin slot
     cur="$("$A" list-workspaces --focused)"
@@ -92,6 +107,7 @@ case "$op" in
       [ -n "$wid" ] && "$A" move-node-to-workspace --window-id "$wid" "$ws"
     done
     moved
+    mark_intent "$ws"
     "$A" workspace "$ws"
     ;;
   throw) # focused WINDOW to the same slot on the other monitor
@@ -100,6 +116,6 @@ case "$op" in
     other="$("$A" list-monitors --format '%{monitor-id}' | grep -vx "$mon" | head -1 || true)"
     [ -n "$other" ] || exit 0
     ws="$(pick "$other" "$s")"
-    [ -n "$ws" ] && { "$A" move-node-to-workspace --focus-follows-window "$ws"; moved; }
+    [ -n "$ws" ] && { mark_intent "$ws"; "$A" move-node-to-workspace --focus-follows-window "$ws"; moved; }
     ;;
 esac

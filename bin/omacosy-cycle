@@ -26,11 +26,38 @@ wm_is_omniwm && exit 0
 A="$(command -v aerospace || echo /opt/homebrew/bin/aerospace)"
 dir="${1:-next}"
 
-WINS="$("$A" list-windows --workspace focused --format '%{window-id}' 2>/dev/null)"
+# H/L cycle the built-in display's stacked windows. On external displays,
+# preserve spatial navigation between columns. Alt+Tab always cycles.
+case "$dir" in
+  left|right)
+    monitor="$("$A" list-windows --focused --format '%{monitor-name}' 2>/dev/null)" || exit 1
+    [ -n "$monitor" ] || exit 1
+    case "$monitor" in
+      Built-in*)
+        if [ "$dir" = left ]; then dir=prev; else dir=next; fi
+        ;;
+      *) exec "$A" focus --boundaries all-monitors-outer-frame "$dir" ;;
+    esac
+    ;;
+  ghostty-next) dir=next; ghostty_only=1 ;;
+  ghostty-prev) dir=prev; ghostty_only=1 ;;
+  next|prev) ;;
+  *) exit 2 ;;
+esac
+
+
+if [ "${ghostty_only:-0}" = 1 ]; then
+  # Guard the asynchronous command as well as the Karabiner app condition.
+  [ "$("$A" list-windows --focused --format '%{app-bundle-id}' 2>/dev/null)" = com.mitchellh.ghostty ] || exit 0
+  WINS="$("$A" list-windows --workspace focused --monitor focused --app-bundle-id com.mitchellh.ghostty --format '%{window-id}' 2>/dev/null)"
+else
+  WINS="$("$A" list-windows --workspace focused --format '%{window-id}' 2>/dev/null)"
+fi
 [ -n "$WINS" ] || exit 0
 CURRENT="$("$A" list-windows --focused --format '%{window-id}' 2>/dev/null || true)"
 
-target="$(printf '%s\n' $WINS | awk -v cur="$CURRENT" -v dir="$dir" '
+# Match the bar's stable ascending window-ID order, not AeroSpace tree order.
+target="$(printf '%s\n' $WINS | sort -n | awk -v cur="$CURRENT" -v dir="$dir" '
   { w[NR] = $0 }
   END {
     if (NR < 2) exit

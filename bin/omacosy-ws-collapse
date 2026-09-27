@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# omacosy-ws-collapse <sync N|collapse|restore> — fold the second
-# display's workspaces into the primary set when a monitor unplugs,
-# and unfold on replug. Called by omacosy-bar (the one long-lived
-# process already watching displays) with `sync <screens>` whenever the
-# screen count changes AND after every wake: a trigger that races the
-# window manager or lands mid-sleep is caught by the next one, and a
-# sync that has nothing to do moves nothing.
+# omacosy-ws-collapse <collapse|restore> — fold the second display's
+# workspaces into the primary set when a monitor unplugs, and unfold
+# on replug. The authorised window agent handles AeroSpace display events;
+# the legacy OmniWM path is still called by its bar integration.
 #
 # collapse: every non-empty guest workspace (two-digit id) empties
 #   into the lowest EMPTY 1-9 slot. With none left, 1N shares N (15
@@ -39,18 +36,17 @@ case "${1:-}" in
 esac
 case "$WANT" in ''|*[!0-9]*) echo "omacosy-ws-collapse: sync needs a screen count" >&2; exit 2 ;; esac
 
-# one run at a time: a monitor flap fires a second sync while the
-# first still moves windows, and two folds would split one map
-LOCK="$STATE_DIR/collapse.lock"
-locked=""
-for _ in $(seq 1 120); do
-  mkdir "$LOCK" 2>/dev/null && { locked=1; break; }
-  # a holder that died (killed mid-run) leaves the dir behind
-  [ -n "$(find "$LOCK" -maxdepth 0 -mmin +3 2>/dev/null)" ] && rmdir "$LOCK" 2>/dev/null
-  sleep 0.5
-done
-[ -n "$locked" ] || { log "sync $WANT: another sync still running after 60s, giving up"; exit 1; }
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+# Serialize display notifications. A disconnect/reconnect can otherwise restore
+# while collapse is still appending to the same recovery map.
+if [ "${OMACOSY_COLLAPSE_LOCK_HELD:-}" != 1 ]; then
+  exec /usr/bin/python3 - "$0" "$@" <<'PYLOCK'
+import fcntl, os, subprocess, sys
+with open(os.path.expanduser("~/.local/state/omacosy/collapse.lock"), "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    env = dict(os.environ, OMACOSY_COLLAPSE_LOCK_HELD="1")
+    sys.exit(subprocess.call(["/bin/bash", *sys.argv[1:]], env=env))
+PYLOCK
+fi
 
 if wm_is_omniwm; then
   # Windows move BY ID (`window move-to-workspace`, OmniWM 0.6.5+) and
@@ -184,11 +180,41 @@ case "$([ "$WANT" = 1 ] && echo collapse || echo restore)" in
       done
       echo "$(date '+%F %T') collapsed $gws -> $T" >>/tmp/omacosy-ws-collapse.log
     done
+    # Consolidate onto the surviving display's saved native desktop, never
+    # whichever guest desktop became current during unplug. The helper selects
+    # that desktop, moves windows in one verified batch, and never deletes Spaces.
+    # Retry only a transient topology/selection deferral, not an unverified move.
+    native_rc=75
+    for delay in 0 1 2; do
+      [ "$delay" = 0 ] || sleep "$delay"
+      [ "$(aerospace list-monitors 2>/dev/null | wc -l | tr -d ' ')" = 1 ] || exit 75
+      if "$HOME/.local/bin/omacosy-native-spaces" collapse >>/tmp/omacosy-ws-collapse.log 2>&1; then
+        native_rc=0
+        break
+      else
+        native_rc=$?
+        [ "$native_rc" = 75 ] || break
+      fi
+    done
+    if [ "$native_rc" != 0 ]; then
+      echo "$(date '+%F %T') native consolidation deferred/failed: $native_rc; recovery map retained" >>/tmp/omacosy-ws-collapse.log
+      exit "$native_rc"
+    fi
+    "$HOME/.local/bin/omacosy-helper" zones sync >>/tmp/omacosy-ws-collapse.log 2>&1
     # moving between two HIDDEN workspaces emits no SkyLight event
     # (nothing on screen changed), so poke the bar directly
     : > /tmp/omacosy-bar-moved
     ;;
   restore)
+    [ "$(aerospace list-monitors 2>/dev/null | wc -l | tr -d ' ')" -gt 1 ] || exit 0
+    # Record actual physical display -> native desktop UUID while both displays
+    # are present. Never infer the survivor from the current desktop on unplug.
+    "$HOME/.local/bin/omacosy-native-spaces" snapshot >>/tmp/omacosy-ws-collapse.log 2>&1 || exit 75
+    # Recover an interrupted restore before claiming the map again.
+    if [ -s "$MAP.run" ]; then
+      cat "$MAP.run" >> "$MAP"
+      rm -f "$MAP.run"
+    fi
     [ -s "$MAP" ] || exit 0
     # claim the map atomically FIRST: a monitor flap can fire a new
     # collapse while restore runs, and its fresh records must land in
@@ -199,10 +225,17 @@ case "$([ "$WANT" = 1 ] && echo collapse || echo restore)" in
     sleep 1
     while IFS=$'\t' read -r wid gws _; do
       [ -n "$wid" ] && [ -n "$gws" ] || continue
-      aerospace move-node-to-workspace --window-id "$wid" "$gws" 2>/dev/null &&
+      if [ "$(aerospace list-monitors 2>/dev/null | wc -l | tr -d ' ')" -gt 1 ] &&
+         aerospace move-node-to-workspace --window-id "$wid" "$gws" 2>/dev/null; then
         echo "$(date '+%F %T') restored $wid -> $gws" >>/tmp/omacosy-ws-collapse.log
+      else
+        # A hotplug flap or failed move must not consume the only recovery record.
+        printf '%s\t%s\n' "$wid" "$gws" >> "$MAP"
+      fi
     done <"$MAP.run"
     rm -f "$MAP.run"
+    # restored windows land wherever macOS put them, often over the bar
+    "$HOME/.local/bin/omacosy-helper" zones sync >>/tmp/omacosy-ws-collapse.log 2>&1
     : > /tmp/omacosy-bar-moved
     ;;
   *)
