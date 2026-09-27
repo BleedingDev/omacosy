@@ -26,4 +26,4 @@ This resembles AeroSpace's [same-app cross-monitor focus issue](https://github.c
 
 The release adds evidence for this regression but does not claim to fix it. Avoid adding a callback that switches the laptop back after the fact: that would recreate the visible workspace flicker. A durable fix needs the intended window focus and workspace visibility to be coordinated by the window manager.
 
-Super is Caps Lock, remapped to Cmd+Ctrl+Opt. The pending configuration adds cursor-following to Super+J/K and vertical arrow aliases. H/L retain laptop window cycling and external directional focus, with cursor-following in both paths. These changes do not alter the mouse-hover focus protocol.
+Super is Caps Lock, remapped to Cmd+Ctrl+Opt. The configuration adds cursor-following to Super+J/K and vertical arrow aliases. H/L retain laptop window cycling and external directional focus, with cursor-following in both paths. These changes do not alter the mouse-hover focus protocol.
