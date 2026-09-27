@@ -5,29 +5,37 @@ import ApplicationServices
 
 final class WindowLifecycle {
     private var observers: [pid_t: AXObserver] = [:]
+    private var windowIDs: [pid_t: [(AXUIElement, UInt32)]] = [:]
     private var pending: DispatchWorkItem?
     private let queue = DispatchQueue(label: "com.omacosy.window-lifecycle")
     private var monitorCount = NSScreen.screens.count
     private var displayChange: DispatchWorkItem?
     private var foldRequired = false
 
-    private func run(_ command: String, _ args: [String]) {
+    private func run(_ command: String, _ args: [String], cause: String) {
         guard NSRunningApplication.runningApplications(withBundleIdentifier: "com.barut.OmniWM").isEmpty else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: NSHomeDirectory() + "/.local/bin/" + command)
         p.arguments = args
+        p.environment = ProcessInfo.processInfo.environment.merging(["OMACOSY_EVENT_ID": cause]) { _, new in new }
+        WindowDiagnostics.shared.record("lifecycle.command.begin", ["cause": cause, "command": command, "args": args])
         do {
             try p.run()
             p.waitUntilExit()
+            WindowDiagnostics.shared.record("lifecycle.command.end", ["cause": cause, "command": command, "exit": Int(p.terminationStatus)])
             if p.terminationStatus != 0 {
                 FileHandle.standardError.write(Data("omacosy lifecycle: \(command) \(args) failed: \(p.terminationStatus)\n".utf8))
             }
         } catch {
+            WindowDiagnostics.shared.record("lifecycle.command.error", ["cause": cause, "command": command, "error": String(describing: error)])
             FileHandle.standardError.write(Data("omacosy lifecycle: \(error)\n".utf8))
         }
     }
 
     private func displaysChanged(forceFold: Bool = false) {
+        let cause = UUID().uuidString
+        WindowDiagnostics.shared.record("displays.changed", ["cause": cause, "fold": forceFold,
+            "screens": NSScreen.screens.map { ["name": $0.localizedName, "frame_appkit": diagnosticRect($0.frame)] }])
         foldRequired = foldRequired || forceFold
         displayChange?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -38,20 +46,21 @@ final class WindowLifecycle {
             self.foldRequired = false
             self.monitorCount = count
             self.queue.async {
-                if fold { self.run("omacosy-ws-collapse", ["sync", String(count)]) }
-                self.run("omacosy-helper", ["zones", "sync"])
+                if fold { self.run("omacosy-ws-collapse", ["sync", String(count)], cause: cause) }
+                self.run("omacosy-helper", ["zones", "sync"], cause: cause)
             }
         }
         displayChange = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
     }
 
-    func changed(pid: pid_t) {
+    func changed(pid: pid_t, reason: String, cause: String = UUID().uuidString) {
+        WindowDiagnostics.shared.record("lifecycle.sync.request", ["cause": cause, "pid": Int(pid), "reason": reason])
         subscribeWindows(pid)
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.queue.async { [weak self] in
-                self?.run("omacosy-helper", ["zones", "sync"])
+                self?.run("omacosy-helper", ["zones", "sync"], cause: cause)
                 DistributedNotificationCenter.default().postNotificationName(
                     Notification.Name("com.omacosy.window-state"), object: nil,
                     userInfo: ["kind": "windows"], deliverImmediately: true)
@@ -69,9 +78,13 @@ final class WindowLifecycle {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement] else { return false }
+        windowIDs[pid] = windows.compactMap { window in
+            var id: UInt32 = 0
+            return AXWindowID(window, &id) == .success ? (window, id) : nil
+        }
         for window in windows {
             for notification in [kAXTitleChangedNotification, kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification,
-                                 kAXWindowDeminiaturizedNotification] {
+                                 kAXWindowDeminiaturizedNotification, kAXMovedNotification, kAXResizedNotification] {
                 AXObserverAddNotification(observer, window, notification as CFString,
                                           Unmanaged.passUnretained(self).toOpaque())
             }
@@ -109,13 +122,38 @@ final class WindowLifecycle {
             guard let context else { return }
             let lifecycle = Unmanaged<WindowLifecycle>.fromOpaque(context).takeUnretainedValue()
             let name = notification as String
+            AXUIElementSetMessagingTimeout(element, 0.1)
+            var pid: pid_t = 0, id: UInt32 = 0
+            AXUIElementGetPid(element, &pid)
+            _ = AXWindowID(element, &id)
+            if id == 0 { id = lifecycle.windowIDs[pid]?.first(where: { CFEqual($0.0, element) })?.1 ?? 0 }
+            var diagnosticElement = element
+            if id == 0, name == kAXFocusedWindowChangedNotification || name == kAXMainWindowChangedNotification {
+                var value: CFTypeRef?
+                if AXUIElementCopyAttributeValue(element, kAXFocusedWindowAttribute as CFString, &value) == .success,
+                   let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
+                    diagnosticElement = value as! AXUIElement
+                    _ = AXWindowID(diagnosticElement, &id)
+                }
+            }
+            let cause = UUID().uuidString
+            if name != kAXTitleChangedNotification {
+                var fields: [String: Any] = ["cause": cause, "notification": name, "pid": Int(pid), "id": Int(id)]
+                if name != kAXUIElementDestroyedNotification { fields["ax"] = diagnosticAXWindow(diagnosticElement) }
+                if name == kAXFocusedWindowChangedNotification || name == kAXWindowCreatedNotification || name == kAXMainWindowChangedNotification {
+                    fields["stack"] = diagnosticNativeStack()
+                    fields["front_pid"] = Int(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1)
+                }
+                WindowDiagnostics.shared.record("native.window", fields)
+            }
+            // Geometry notifications are evidence only. Reacting with layout
+            // here would turn our own AX writes into another feedback loop.
+            if name == kAXMovedNotification || name == kAXResizedNotification || name == kAXMainWindowChangedNotification { return }
             if name == kAXTitleChangedNotification || name == kAXFocusedWindowChangedNotification {
                 lifecycle.publishMetadata(element, focused: name == kAXFocusedWindowChangedNotification)
                 return
             }
-            var pid: pid_t = 0
-            AXUIElementGetPid(element, &pid)
-            lifecycle.changed(pid: pid)
+            lifecycle.changed(pid: pid, reason: name, cause: cause)
         }, &observer) == .success, let observer else { return }
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, 0.2)
@@ -123,12 +161,14 @@ final class WindowLifecycle {
                                         Unmanaged.passUnretained(self).toOpaque()) == .success else { return }
         AXObserverAddNotification(observer, axApp, kAXFocusedWindowChangedNotification as CFString,
                                   Unmanaged.passUnretained(self).toOpaque())
+        AXObserverAddNotification(observer, axApp, kAXMainWindowChangedNotification as CFString,
+                                  Unmanaged.passUnretained(self).toOpaque())
         observers[pid] = observer
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
         // Catch windows created before the launch/activation notification.
         // An app with no windows is still starting; its AX creation event
         // will schedule layout when there is actually something to manage.
-        if subscribeWindows(pid) { changed(pid: pid) }
+        if subscribeWindows(pid) { changed(pid: pid, reason: "attach-existing-windows") }
     }
 
     func start() {
@@ -143,11 +183,14 @@ final class WindowLifecycle {
             }
         }
         center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.changed(pid: 0)
+            self?.changed(pid: 0, reason: "native-space-changed")
         }
         for event in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification] {
             center.addObserver(forName: event, object: nil, queue: .main) { [weak self] note in
                 if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                    WindowDiagnostics.shared.record("native.application", ["notification": event.rawValue,
+                        "pid": Int(app.processIdentifier), "app": app.bundleIdentifier ?? "unknown",
+                        "stack": diagnosticNativeStack()])
                     self?.attach(app)
                     if event == NSWorkspace.didActivateApplicationNotification {
                         self?.publishMetadata(AXUIElementCreateApplication(app.processIdentifier), focused: true)
@@ -160,12 +203,14 @@ final class WindowLifecycle {
             if let observer = self.observers.removeValue(forKey: app.processIdentifier) {
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
             }
-            self.changed(pid: app.processIdentifier)
+            self.windowIDs.removeValue(forKey: app.processIdentifier)
+            self.changed(pid: app.processIdentifier, reason: "application-terminated")
         }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.displaysChanged()
         }
-        changed(pid: 0)
+        WindowDiagnostics.shared.record("lifecycle.start", ["stack": diagnosticNativeStack()])
+        changed(pid: 0, reason: "agent-start")
     }
 }

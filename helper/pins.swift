@@ -101,7 +101,11 @@ func reconcilePins(dryRun: Bool = false) -> [[String: Any]] {
         else { continue }
         let move = target != workspace
         if move && !dryRun {
-            _ = try? pinCommand(["move-node-to-workspace", "--window-id", String(id), target])
+            let operation = UUID().uuidString
+            let context: [String: Any] = ["operation": operation, "id": id, "from": workspace, "to": target]
+            WindowDiagnostics.shared.record("pin.move.begin", context)
+            let accepted = (try? pinCommand(["move-node-to-workspace", "--window-id", String(id), target])) != nil
+            WindowDiagnostics.shared.record("pin.move.end", context.merging(["command_accepted": accepted]) { _, new in new })
         }
         report.append(["id": id, "rule": rule.matcher, "from": workspace, "to": target, "move": move])
     }

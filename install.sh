@@ -342,9 +342,9 @@ mkdir -p "$HOME/.local/bin"
 # cliclick and desktoppr dependencies; swiftc ships with the CLT that
 # Homebrew already requires
 "$REPO_DIR/bin/omacosy-sign" --check "$HOME/.local/bin/omacosy-helper" com.omacosy.helper
-if [ ! -x "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/main.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/zones.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/pins.swift" -nt "$HOME/.local/bin/omacosy-helper" ]; then
+if [ ! -x "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/main.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/zones.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/pins.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/zone-monitor-policy.swift" -nt "$HOME/.local/bin/omacosy-helper" ] || [ "$REPO_DIR/helper/window-diagnostics.swift" -nt "$HOME/.local/bin/omacosy-helper" ]; then
   log "Building omacosy-helper"
-  swiftc -O -F /System/Library/PrivateFrameworks -framework DisplayServices -o "$HOME/.local/bin/omacosy-helper" "$REPO_DIR/helper/main.swift" "$REPO_DIR/helper/zones.swift" "$REPO_DIR/helper/pins.swift"
+  swiftc -O -F /System/Library/PrivateFrameworks -framework DisplayServices -o "$HOME/.local/bin/omacosy-helper" "$REPO_DIR/helper/main.swift" "$REPO_DIR/helper/zones.swift" "$REPO_DIR/helper/pins.swift" "$REPO_DIR/helper/zone-monitor-policy.swift" "$REPO_DIR/helper/window-diagnostics.swift"
 fi
 
 # workspace overview overlay (4-finger swipe up)
@@ -401,9 +401,9 @@ if [ ! -x "$HOME/.local/bin/omacosy-native-spaces" ] || [ "$REPO_DIR/helper/nati
   clang -fobjc-arc -O2 -framework AppKit -F /System/Library/PrivateFrameworks -framework SkyLight "$REPO_DIR/helper/native-spaces.m" -o "$HOME/.local/bin/omacosy-native-spaces"
 fi
 
-if [ ! -x "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/ffm.swift" -nt "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/window-lifecycle.swift" -nt "$HOME/.local/bin/omacosy-ffm" ]; then
+if [ ! -x "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/ffm.swift" -nt "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/window-lifecycle.swift" -nt "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/window-diagnostics.swift" -nt "$HOME/.local/bin/omacosy-ffm" ]; then
   log "Building omacosy-ffm (grant Accessibility when prompted)"
-  swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-ffm" "$REPO_DIR/helper/ffm.swift" "$REPO_DIR/helper/window-lifecycle.swift"
+  swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-ffm" "$REPO_DIR/helper/ffm.swift" "$REPO_DIR/helper/window-lifecycle.swift" "$REPO_DIR/helper/window-diagnostics.swift"
 fi
 
 # focused-window border ring (replaces JankyBorders; no permissions;

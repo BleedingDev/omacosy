@@ -36,7 +36,11 @@ case "$dir" in
       Built-in*)
         if [ "$dir" = left ]; then dir=prev; else dir=next; fi
         ;;
-      *) exec "$A" focus --boundaries all-monitors-outer-frame "$dir" ;;
+      *)
+        "$A" focus --boundaries all-monitors-outer-frame "$dir" || exit 1
+        "$A" move-mouse window-lazy-center
+        exit
+        ;;
     esac
     ;;
   ghostty-next) dir=next; ghostty_only=1 ;;

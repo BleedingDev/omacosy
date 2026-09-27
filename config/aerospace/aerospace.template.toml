@@ -64,13 +64,13 @@ cmd-ctrl-alt-space = 'exec-and-forget open -a Raycast'
 # Close remains a native app action during this setup.
 
 # Focus: Vim home row and arrow aliases; vertical navigation switches displays.
-cmd-ctrl-alt-left = 'focus --boundaries all-monitors-outer-frame left'
-cmd-ctrl-alt-down = 'focus-monitor down'
-cmd-ctrl-alt-up = 'focus-monitor up'
-cmd-ctrl-alt-right = 'focus --boundaries all-monitors-outer-frame right'
+cmd-ctrl-alt-left = 'exec-and-forget $HOME/.local/bin/omacosy-cycle left'
+cmd-ctrl-alt-down = ['focus-monitor down', 'move-mouse window-lazy-center']
+cmd-ctrl-alt-up = ['focus-monitor up', 'move-mouse window-lazy-center']
+cmd-ctrl-alt-right = 'exec-and-forget $HOME/.local/bin/omacosy-cycle right'
 cmd-ctrl-alt-h = 'exec-and-forget $HOME/.local/bin/omacosy-cycle left'
-cmd-ctrl-alt-j = 'focus-monitor down'
-cmd-ctrl-alt-k = 'focus-monitor up'
+cmd-ctrl-alt-j = ['focus-monitor down', 'move-mouse window-lazy-center']
+cmd-ctrl-alt-k = ['focus-monitor up', 'move-mouse window-lazy-center']
 cmd-ctrl-alt-l = 'exec-and-forget $HOME/.local/bin/omacosy-cycle right'
 
 # Move windows (omarchy: Super+Shift+Arrows)
@@ -146,7 +146,7 @@ alt-tab = 'exec-and-forget $HOME/.local/bin/omacosy-cycle next'
 alt-shift-tab = 'exec-and-forget $HOME/.local/bin/omacosy-cycle prev'
 
 # Cycle focus between monitors (omarchy: Ctrl+Alt+Tab, and free here)
-ctrl-alt-tab = 'focus-monitor next --wrap-around'
+ctrl-alt-tab = ['focus-monitor next --wrap-around', 'move-mouse window-lazy-center']
 
 # Throw window to the other monitor
 # the same slot, so the twin workspace keeps its meaning

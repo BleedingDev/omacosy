@@ -52,6 +52,12 @@ private struct ZoneState: Codable {
 
 private func zoneCommand(_ args: [String]) throws -> String {
     let p = Process(), out = Pipe(), err = Pipe()
+    let commandID = UUID().uuidString
+    let started = ProcessInfo.processInfo.systemUptime
+    WindowDiagnostics.shared.record("wm.command.begin", ["command": commandID, "args": args])
+    defer { WindowDiagnostics.shared.record("wm.command.end", ["command": commandID,
+        "duration": ProcessInfo.processInfo.systemUptime - started,
+        "exit": p.isRunning ? -1 : (p.processIdentifier == 0 ? -2 : Int(p.terminationStatus))]) }
     p.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/aerospace")
     p.arguments = args
     // Explicit IDs below; never inherit a stale callback's target.
@@ -121,13 +127,39 @@ private func zoneConstrainedFrame(_ target: CGRect, size: CGSize) -> CGRect? {
                   y: target.minY, width: size.width, height: size.height)
 }
 
-private func zoneSetFrame(_ window: AXUIElement, _ rect: CGRect) -> Bool {
+private func zoneSetFrame(_ window: AXUIElement, _ rect: CGRect, context: [String: Any]) -> Bool {
     var p = rect.origin, s = rect.size
     guard let position = AXValueCreate(.cgPoint, &p), let size = AXValueCreate(.cgSize, &s) else { return false }
+    func write(_ attribute: String, _ value: AXValue) -> Bool {
+        var fields = context
+        fields["attribute"] = attribute
+        fields["requested"] = diagnosticRect(rect)
+        if attribute == kAXPositionAttribute {
+            var point = CGPoint.zero
+            if AXValueGetValue(value, .cgPoint, &point) { fields["value"] = [point.x, point.y] }
+        } else {
+            var size = CGSize.zero
+            if AXValueGetValue(value, .cgSize, &size) { fields["value"] = [size.width, size.height] }
+        }
+        // Fullscreen can change even after the final WM snapshot. Recheck
+        // natively before every individual AX write, without another WM refresh.
+        guard zoneAttribute(window, "AXFullScreen") as? Bool == false,
+              zoneAttribute(window, kAXMinimizedAttribute) as? Bool == false else {
+            fields["reason"] = "fullscreen-minimized-or-unreadable"
+            WindowDiagnostics.shared.record("geometry.skip", fields)
+            return false
+        }
+        fields["before"] = zoneRect(window).map(diagnosticRect) ?? []
+        WindowDiagnostics.shared.record("geometry.write.begin", fields)
+        let result = AXUIElementSetAttributeValue(window, attribute as CFString, value)
+        fields["ax_error"] = result.rawValue
+        fields["after"] = zoneRect(window).map(diagnosticRect) ?? []
+        WindowDiagnostics.shared.record("geometry.write.end", fields)
+        return result == .success
+    }
     // Shrink first so macOS does not clamp the position against the old size.
-    guard AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, size) == .success,
-          AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, position) == .success,
-          AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, size) == .success else { return false }
+    guard write(kAXSizeAttribute, size), write(kAXPositionAttribute, position),
+          write(kAXSizeAttribute, size) else { return false }
     guard let actual = zoneRect(window) else { return false }
     if zoneSame(actual, rect) { return true }
     // Video windows can enforce their aspect ratio even though AXSize is
@@ -136,7 +168,7 @@ private func zoneSetFrame(_ window: AXUIElement, _ rect: CGRect) -> Bool {
     guard let fitted = zoneConstrainedFrame(rect, size: actual.size) else { return false }
     var fittedPoint = fitted.origin
     guard let fittedPosition = AXValueCreate(.cgPoint, &fittedPoint) else { return false }
-    guard AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, fittedPosition) == .success else { return false }
+    guard write(kAXPositionAttribute, fittedPosition) else { return false }
     return zoneRect(window).map { zoneSame($0, fitted) } ?? false
 }
 
@@ -324,16 +356,107 @@ func runZones(_ args: [String]) {
         // Pinned windows settle their workspace before this pass reads the
         // window list, or a window the pin moves away would still count as
         // occupying a slot here.
-        if action == "sync" { _ = reconcilePins() }
+        let pinned = action == "sync" ? reconcilePins() : []
+        let pinnedIDs = Set(pinned.compactMap { $0["id"] as? Int })
         var bootTime = timeval(), bootSize = MemoryLayout<timeval>.size
         guard sysctlbyname("kern.boottime", &bootTime, &bootSize, nil, 0) == 0 else { fail("zones: cannot identify boot session") }
         let boot = "\(bootTime.tv_sec)"
         let original = try? Data(contentsOf: url)
         var state = original.flatMap { try? JSONDecoder().decode(ZoneState.self, from: $0) } ?? ZoneState(boot: boot)
         if state.boot != boot { state.boot = boot; state.windows = [:] }
+        let knownWindowKeys = Set(state.windows.keys)
         let format = "%{window-id} %{app-bundle-id} %{app-pid} %{workspace} %{window-layout} %{monitor-name}"
-        let rows = try zoneRows(["list-windows", "--all", "--format", format])
-        let visibleRows = try zoneRows(["list-workspaces", "--monitor", "all", "--visible"])
+        var rows = try zoneRows(["list-windows", "--all", "--format", format])
+        let workspaceArgs = ["list-workspaces", "--monitor", "all", "--visible", "--format", "%{workspace} %{monitor-name}"]
+        var visibleRows = try zoneRows(workspaceArgs)
+        func monitorSnapshot() -> [ZoneMonitor] {
+            NSScreen.screens.compactMap { screen in
+                guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+                return ZoneMonitor(name: screen.localizedName, frame: CGDisplayBounds(id.uint32Value))
+            }
+        }
+        func visibleByMonitor(_ values: [[String: Any]]) -> [String: [String]] {
+            var result: [String: [String]] = [:]
+            for row in values {
+                if let monitor = row["monitor-name"] as? String, let workspace = row["workspace"] as? String {
+                    result[monitor, default: []].append(workspace)
+                }
+            }
+            return result.mapValues { $0.sorted() }
+        }
+        let pass = UUID().uuidString
+        let cause = ProcessInfo.processInfo.environment["OMACOSY_EVENT_ID"] ?? "direct-or-workspace-hook"
+        WindowDiagnostics.shared.record("zones.begin", ["pass": pass, "action": action, "cause": cause,
+            "callback_workspace": ProcessInfo.processInfo.environment["AEROSPACE_FOCUSED_WORKSPACE"] ?? "",
+            "callback_previous_workspace": ProcessInfo.processInfo.environment["AEROSPACE_PREV_WORKSPACE"] ?? ""])
+        // Resolve AX once. Nothing is moved while enumerating application windows.
+        var axWindows: [Int: AXUIElement] = [:]
+        for pid in Set(rows.compactMap { $0["app-pid"] as? Int }) {
+            let app = AXUIElementCreateApplication(pid_t(pid))
+            AXUIElementSetMessagingTimeout(app, 0.3)
+            for w in zoneAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
+                var id: CGWindowID = 0
+                if zoneWindowID(w, &id) == .success { axWindows[Int(id)] = w }
+            }
+        }
+        let restoreScreens = monitorSnapshot()
+        let restoreVisible = visibleByMonitor(visibleRows)
+        var reconciled = false
+        for row in rows {
+            guard let id = row["window-id"] as? Int, let pid = row["app-pid"] as? Int,
+                  let workspace = row["workspace"] as? String, let monitor = row["monitor-name"] as? String,
+                  let app = row["app-bundle-id"] as? String, let window = axWindows[id],
+                  let frame = zoneRect(window) else { continue }
+            let context: [String: Any] = ["pass": pass, "id": id, "pid": pid, "app": app,
+                "workspace": workspace, "monitor": monitor, "frame": diagnosticRect(frame),
+                "physical_monitor": zonePhysicalMonitor(frame, screens: restoreScreens) ?? "ambiguous-or-hidden",
+                "ax": diagnosticAXWindow(window)]
+            WindowDiagnostics.shared.record("window.snapshot", context)
+            var resizable: DarwinBoolean = false
+            guard AXUIElementIsAttributeSettable(window, kAXSizeAttribute as CFString, &resizable) == .success,
+                  zoneParticipates(subrole: zoneAttribute(window, kAXSubroleAttribute) as? String, resizable: resizable.boolValue, app: app),
+                  let destination = zoneRestoreDestination(action: action, known: state.windows["\(pid):\(id)"] != nil,
+                    pinned: pinnedIDs.contains(id), fullscreen: row["window-layout"] as? String == "macos_native_fullscreen" ||
+                        zoneAttribute(window, "AXFullScreen") as? Bool != false,
+                    workspace: workspace, monitor: monitor, frame: frame, screens: restoreScreens, visible: restoreVisible)
+            else { continue }
+            var decision = context
+            decision["destination"] = destination
+            decision["reason"] = "new-window-restored-on-other-display"
+            let now = try zoneRows(["list-windows", "--all", "--format", format]).first { $0["window-id"] as? Int == id }
+            let nowVisible = try zoneRows(workspaceArgs)
+            guard zoneWindowStillEligible(id: id, pid: pid, workspace: workspace, monitor: monitor, current: now,
+                    fullscreen: zoneAttribute(window, "AXFullScreen") as? Bool, minimized: zoneAttribute(window, kAXMinimizedAttribute) as? Bool),
+                  monitorSnapshot() == restoreScreens, visibleByMonitor(nowVisible) == restoreVisible,
+                  zoneRect(window).map({ zoneSame($0, frame) }) == true else {
+                decision["reason"] = "restore-snapshot-changed"
+                decision["current"] = now ?? [:]
+                decision["current_frame"] = zoneRect(window).map(diagnosticRect) ?? []
+                decision["current_visible"] = visibleByMonitor(nowVisible)
+                WindowDiagnostics.shared.record("workspace.reconcile.skip", decision)
+                continue
+            }
+            WindowDiagnostics.shared.record("workspace.reconcile.begin", decision)
+            do {
+                _ = try zoneCommand(["move-node-to-workspace", "--window-id", String(id), destination])
+            } catch {
+                decision["error_code"] = (error as NSError).code
+                WindowDiagnostics.shared.record("workspace.reconcile.error", decision)
+                throw error
+            }
+            let after = try zoneRows(["list-windows", "--all", "--format", format])
+                .first { $0["window-id"] as? Int == id }
+            decision["actual_workspace"] = after?["workspace"] as? String ?? "missing"
+            decision["verified"] = after?["workspace"] as? String == destination
+            WindowDiagnostics.shared.record("workspace.reconcile.end", decision)
+            guard after?["workspace"] as? String == destination else { return }
+            reconciled = true
+        }
+        // A membership change invalidates the whole allocation/focus snapshot.
+        if reconciled {
+            rows = try zoneRows(["list-windows", "--all", "--format", format])
+            visibleRows = try zoneRows(workspaceArgs)
+        }
         let visibleSnapshot = Set(visibleRows.compactMap { $0["workspace"] as? String })
         let focus = (try? zoneRows(["list-windows", "--focused", "--format", "%{window-id}"]))?.first?["window-id"] as? Int
         let focused = try zoneCommand(["list-workspaces", "--focused"])
@@ -352,16 +475,12 @@ func runZones(_ args: [String]) {
             // repairs out-of-range slots only when the slot count shrinks.
         }
         let screens = NSScreen.screens
+        let screenSnapshot = monitorSnapshot()
+        let workspaceSnapshot = visibleByMonitor(visibleRows)
+        WindowDiagnostics.shared.record("zones.snapshot", ["pass": pass, "visible": workspaceSnapshot,
+            "focused_workspace": focusedWorkspace, "focused_window": focus ?? -1,
+            "screens": screenSnapshot.map { ["name": $0.name, "frame": diagnosticRect($0.frame)] }])
         let primaryHeight = screens.first(where: { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == CGMainDisplayID() })?.frame.maxY ?? 0
-        var axWindows: [Int: AXUIElement] = [:]
-        for pid in Set(rows.compactMap { $0["app-pid"] as? Int }) {
-            let app = AXUIElementCreateApplication(pid_t(pid))
-            AXUIElementSetMessagingTimeout(app, 0.3)
-            for w in zoneAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
-                var id: CGWindowID = 0
-                if zoneWindowID(w, &id) == .success { axWindows[Int(id)] = w }
-            }
-        }
         // Only resizable desktop windows participate. Free windows and
         // fixed-size/system dialogs neither occupy slots nor uncenter a peer.
         var normalWindowIDs = Set<Int>()
@@ -444,8 +563,11 @@ func runZones(_ args: [String]) {
             // The compact display has a different slot count. Do not persist
             // its temporary slot over the CR9 placement when undocked.
             if external { placement.slot = min(displaySlot, layout.slots - 1) }
-            state.windows[key] = placement
-            if placement.free { report.append(["id": id, "status": "free"]); continue }
+            if placement.free {
+                state.windows[key] = placement
+                report.append(["id": id, "status": "free"])
+                continue
+            }
             let frame = screen.frame, visibleFrame = screen.visibleFrame
             // Reserve the actual 34-point bar, including the notch/menu strip.
             let top = max(primaryHeight - visibleFrame.maxY, primaryHeight - frame.maxY + 34)
@@ -456,28 +578,67 @@ func runZones(_ args: [String]) {
             let target = placement.maximized ? area : (external
                 ? zoneTarget(area, slot: placement.slot, layout: layout, centered: windowCounts[occupancyKey] == 1)
                 : zoneCompactTarget(area, slot: compactSlot, count: windowCounts[occupancyKey] ?? 1))
-            if action != "status" {
+            let needsWrite = row["window-layout"] as? String != "floating" || (zoneRect(window).map { !zoneSame($0, target) } ?? true)
+            if action != "status", needsWrite {
                 // AX enumeration can be slow. Never use its old workspace
                 // snapshot to pull an already-hidden window back on screen.
-                let nowVisible = Set(try zoneRows(["list-workspaces", "--monitor", "all", "--visible"])
-                    .compactMap { $0["workspace"] as? String })
+                let nowWorkspaces = try zoneRows(workspaceArgs)
+                let nowVisible = Set(nowWorkspaces.compactMap { $0["workspace"] as? String })
                 let nowFocused = try zoneCommand(["list-workspaces", "--focused"])
                     .split(whereSeparator: \.isNewline).map(String.init)
                 let nowWindowWorkspace = try zoneCommand(["list-windows", "--focused", "--format", "%{workspace}"])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard nowVisible == visibleSnapshot, nowFocused == focused,
                       nowWindowWorkspace.isEmpty || nowWindowWorkspace == focusedWorkspace,
-                      NSScreen.screens.count == screens.count else { return }
+                      monitorSnapshot() == screenSnapshot, visibleByMonitor(nowWorkspaces) == workspaceSnapshot else {
+                    WindowDiagnostics.shared.record("zones.abort", ["pass": pass, "reason": "workspace-focus-or-displays-changed", "id": id])
+                    return
+                }
+                let context: [String: Any] = ["pass": pass, "action": action, "id": id, "pid": pid,
+                    "workspace": workspace, "monitor": monitor, "target": diagnosticRect(target)]
+                func stillEligible() throws -> Bool {
+                    let current = try zoneRows(["list-windows", "--all", "--format", format])
+                        .first { $0["window-id"] as? Int == id }
+                    let fullscreen = zoneAttribute(window, "AXFullScreen") as? Bool
+                    let minimized = zoneAttribute(window, kAXMinimizedAttribute) as? Bool
+                    let eligible = zoneWindowStillEligible(id: id, pid: pid, workspace: workspace, monitor: monitor,
+                        current: current, fullscreen: fullscreen, minimized: minimized)
+                    WindowDiagnostics.shared.record("geometry.validate", context.merging([
+                        "current": current ?? [:], "eligible": eligible,
+                        "fullscreen": fullscreen.map { $0 as Any } ?? NSNull(),
+                        "minimized": minimized.map { $0 as Any } ?? NSNull(),
+                        "current_frame": zoneRect(window).map(diagnosticRect) ?? []
+                    ]) { _, new in new })
+                    return eligible
+                }
+                guard try stillEligible() else {
+                    WindowDiagnostics.shared.record("geometry.skip", context.merging(["reason": "target-window-changed-or-unreadable"]) { _, new in new })
+                    continue
+                }
                 if row["window-layout"] as? String != "floating",
                    (try? zoneCommand(["layout", "--window-id", String(id), "floating"])) == nil {
                     report.append(["id": id, "status": "cannot float window"])
                     failed += 1
                     continue
                 }
+                // layout itself can refresh the WM model, so revalidate after it.
+                if row["window-layout"] as? String != "floating", try !stillEligible() { continue }
                 if let actual = zoneRect(window), !zoneSame(actual, target) {
-                    if zoneSetFrame(window, target) { changed += 1 } else { failed += 1 }
+                    // An unseen window on another screen with no unambiguous
+                    // restore destination must not be teleported as a fallback.
+                    if action == "sync", !knownWindowKeys.contains(key),
+                       let physical = zonePhysicalMonitor(actual, screens: screenSnapshot), physical != monitor,
+                       !pinnedIDs.contains(id) {
+                        WindowDiagnostics.shared.record("geometry.skip", context.merging(["reason": "unresolved-new-window-monitor-mismatch"]) { _, new in new })
+                        state.windows.removeValue(forKey: key)
+                        continue
+                    }
+                    if zoneSetFrame(window, target, context: context) { changed += 1 } else { failed += 1; continue }
                 }
             }
+            // Do not mark a new window as settled when a stale/fullscreen
+            // guard skipped it. A later pass must still reconcile its screen.
+            state.windows[key] = placement
             let actual = zoneRect(window) ?? .zero
             let constrained = !zoneSame(actual, target) &&
                 (zoneConstrainedFrame(target, size: actual.size).map { zoneSame(actual, $0) } ?? false)
@@ -487,6 +648,7 @@ func runZones(_ args: [String]) {
                            "matches": zoneSame(actual, target), "constrained": constrained])
         }
         state.windows = state.windows.filter { liveKeys.contains($0.key) }
+        WindowDiagnostics.shared.record("zones.end", ["pass": pass, "changed": changed, "failed": failed])
         if action != "status" {
             let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(state)

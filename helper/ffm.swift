@@ -290,7 +290,17 @@ func process(confirmed: Bool) {
             // change) otherwise gets bounced as an "app yank".
             FileManager.default.createFile(
                 atPath: "/tmp/omacosy-user-intent-\(getuid())", contents: nil)
-            if slpsFocus(pid: hit.pid, wid: hit.wid) {
+            let focusID = UUID().uuidString
+            let focusContext: [String: Any] = ["focus_request": focusID, "id": Int(hit.wid), "pid": Int(hit.pid),
+                "front_pid": Int(frontPid), "cursor": [e.location.x, e.location.y],
+                "target_frame": diagnosticRect(hit.rect), "stack": diagnosticNativeStack()]
+            WindowDiagnostics.shared.record("ffm.focus.begin", focusContext)
+            let accepted = slpsFocus(pid: hit.pid, wid: hit.wid)
+            WindowDiagnostics.shared.record("ffm.focus.end", ["focus_request": focusID, "id": Int(hit.wid),
+                "pid": Int(hit.pid), "api_accepted": accepted,
+                "front_pid": Int(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1),
+                "stack": diagnosticNativeStack()])
+            if accepted {
                 lastFocusAt = now
                 lastKey = hit.key
                 DistributedNotificationCenter.default().postNotificationName(
