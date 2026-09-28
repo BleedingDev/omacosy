@@ -1,70 +1,69 @@
+--- a/Package.swift
++++ b/Package.swift
+@@ -35,6 +35,7 @@
+             name: "PrivateApi",
+             path: "Sources/PrivateApi",
+             publicHeadersPath: "include",
++            linkerSettings: [.unsafeFlags(["-F/System/Library/PrivateFrameworks", "-framework", "SkyLight"])],
+         ),
+         .target(
+             name: "Common",
+--- a/Sources/AppBundle/GlobalObserver.swift
++++ b/Sources/AppBundle/GlobalObserver.swift
+@@ -45,6 +45,10 @@
+ 
+     @MainActor
+     static func initObserver() {
++        NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) { event in
++            let timestamp = event.timestamp
++            Task { @MainActor in NativeFocusCoordinator.userInput(timestamp: timestamp) }
++        }
+         let nc = NSWorkspace.shared.notificationCenter
+         nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main, using: onNotif)
+         nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main, using: onNotif)
+--- a/Sources/AppBundle/command/impl/FocusCommand.swift
++++ b/Sources/AppBundle/command/impl/FocusCommand.swift
+@@ -34,6 +34,10 @@
+                 }
+             case .windowId(let windowId):
+                 if let windowToFocus = Window.get(byId: windowId) {
++                    // Hover can select only an already-visible window. Never reveal
++                    // a hidden workspace on behalf of a stale hit test.
++                    if args.noRaise && windowToFocus.nodeWorkspace?.isVisible != true { return .fail }
++
+                     return .from(bool: windowToFocus.focusWindow())
+                 } else {
+                     return .fail(io.err("Can't find window with ID \(windowId)"))
+--- a/Sources/AppBundle/focusCache.swift
++++ b/Sources/AppBundle/focusCache.swift
+@@ -1,9 +1,12 @@
+ @MainActor private var lastKnownNativeFocusedWindowId: UInt32? = nil
++
++@MainActor func invalidateNativeFocusCache() { lastKnownNativeFocusedWindowId = nil }
+ 
+ /// The data should flow (from nativeFocused to focused) and
+ ///                      (from nativeFocused to lastKnownNativeFocusedWindowId)
+ /// Alternative names: takeFocusFromMacOs, syncFocusFromMacOs
+ @MainActor func updateFocusCache(_ nativeFocused: Window?) {
++    guard NativeFocusCoordinator.accept(nativeFocused) else { return }
+     if nativeFocused?.parent is MacosPopupWindowsContainer {
+         return
+     }
 --- a/Sources/AppBundle/getNativeFocusedWindow.swift
 +++ b/Sources/AppBundle/getNativeFocusedWindow.swift
-@@ -21,5 +21,15 @@
+@@ -21,5 +21,11 @@
  
  @MainActor
  func getNativeFocusedWindow(_ cm: CancellationMode) async throws -> Window? {
 -    try await focusedApp?.getFocusedWindow(cm)
-+    let initial = try await focusedApp?.getFocusedWindow(cm)
-+    guard initial?.nodeWorkspace?.isVisible == false else { return initial }
-+    // Application activation can expose its previous key window before the
-+    // requested key-window event is delivered. Do not reveal a hidden workspace
-+    // from that intermediate value. Re-read the app as well as its window.
-+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
-+            continuation.resume()
-+        }
++    // AX reads suspend. A request or acknowledgement can arrive while a read
++    // is in flight; do not commit a snapshot from the previous transaction.
++    while true {
++        let revision = NativeFocusCoordinator.observationRevision
++        let window = try await focusedApp?.getFocusedWindow(cm)
++        if revision == NativeFocusCoordinator.observationRevision { return window }
 +    }
-+    return try await focusedApp?.getFocusedWindow(cm)
  }
---- /dev/null
-+++ b/Sources/AppBundleTests/NativeFocusStabilityTest.swift
-@@ -0,0 +1,45 @@
-+@testable import AppBundle
-+import Common
-+import XCTest
-+
-+@MainActor
-+final class NativeFocusStabilityTest: XCTestCase {
-+    override func setUp() async throws { setUpWorkspacesForTests() }
-+
-+    func testTransientHiddenWindowDoesNotBecomeTheFocusResult() async throws {
-+        let visible = Workspace.get(byName: "visible")
-+        let hidden = Workspace.get(byName: "hidden")
-+        _ = visible.focusWorkspace()
-+        let old = TestWindow.new(id: 8101, parent: hidden.rootTilingContainer)
-+        let requested = TestWindow.new(id: 8102, parent: visible.rootTilingContainer)
-+        old.nativeFocus()
-+        XCTAssertFalse(hidden.isVisible)
-+        let transition = Task { @MainActor in
-+            try await Task.sleep(for: .milliseconds(20))
-+            requested.nativeFocus()
-+        }
-+        let result = try await getNativeFocusedWindow(.cancellable)
-+        try await transition.value
-+        XCTAssertEqual(result?.windowId, requested.windowId)
-+        XCTAssertFalse(hidden.isVisible)
-+    }
-+
-+    func testIntentionalHiddenWindowActivationStillWorks() async throws {
-+        let visible = Workspace.get(byName: "visible")
-+        let hidden = Workspace.get(byName: "hidden")
-+        _ = visible.focusWorkspace()
-+        let requested = TestWindow.new(id: 8103, parent: hidden.rootTilingContainer)
-+        requested.nativeFocus()
-+        let result = try await getNativeFocusedWindow(.cancellable)
-+        XCTAssertEqual(result?.windowId, requested.windowId)
-+    }
-+
-+    func testVisibleWindowIsReadWithoutWaitingForAnotherActivation() async throws {
-+        let visible = Workspace.get(byName: "visible")
-+        _ = visible.focusWorkspace()
-+        let requested = TestWindow.new(id: 8104, parent: visible.rootTilingContainer)
-+        requested.nativeFocus()
-+        let result = try await getNativeFocusedWindow(.cancellable)
-+        XCTAssertEqual(result?.windowId, requested.windowId)
-+    }
-+}
 --- a/Sources/AppBundle/initAppBundle.swift
 +++ b/Sources/AppBundle/initAppBundle.swift
 @@ -1,4 +1,5 @@
@@ -87,3 +86,473 @@
              case "--read-only": // todo rename to '--disabled' and unite with disabled feature
                  unsafe _serverArgs.isReadOnly = true
              case "-NSDocumentRevisionsDebugMode" where isDebug:
+--- a/Sources/AppBundle/layout/refresh.swift
++++ b/Sources/AppBundle/layout/refresh.swift
+@@ -70,6 +70,12 @@
+         if let nativeFocused { try await debugWindowsIfRecording(nativeFocused, .cancellable) }
+         updateFocusCache(nativeFocused)
+         let focusBefore = focus.windowOrNil
++        let noRaise: Bool
++        let noRaiseWindowId: UInt32?
++        if case .socketServer(let args) = event {
++            noRaise = (args as? FocusCmdArgs)?.noRaise == true
++            noRaiseWindowId = noRaise ? (args as? FocusCmdArgs)?.windowId : nil
++        } else { noRaise = false; noRaiseWindowId = nil }
+ 
+         await refreshModel_nonCancellable()
+         let result = try await body()
+@@ -79,9 +85,9 @@
+ 
+         updateTrayText()
+         SecureInputPanel.shared.refresh()
+-        if !event.isFocusFollowsMouse { try await layoutWorkspaces() }
+-        if focusBefore != focusAfter {
+-            focusAfter?.nativeFocus() // syncFocusToMacOs
++        if !event.isFocusFollowsMouse && !noRaise { try await layoutWorkspaces() }
++        if focusBefore != focusAfter || (noRaise && focusAfter?.windowId == noRaiseWindowId) {
++            focusAfter?.nativeFocus(raise: !noRaise) // syncFocusToMacOs
+         }
+         if !event.isFocusFollowsMouse { scheduleCancellableCompleteRefreshSession(event) }
+         return result
+--- /dev/null
++++ b/Sources/AppBundle/nativeFocusRequest.swift
+@@ -0,0 +1,81 @@
++import AppKit
++import Common
++
++struct NativeFocusRequest: Equatable {
++    let generation: UInt64
++    let windowId: UInt32
++    let pid: pid_t
++    let sourcePid: pid_t?
++    let started: TimeInterval
++
++    enum Observation { case acknowledge, intermediate, superseded }
++    func observe(windowId: UInt32?, pid: pid_t?) -> Observation {
++        if windowId == self.windowId && pid == self.pid { return .acknowledge }
++        if pid == nil || pid == self.pid || pid == sourcePid { return .intermediate }
++        return .superseded
++    }
++}
++
++@MainActor enum NativeFocusCoordinator {
++    static private(set) var generation: UInt64 = 0
++    static private(set) var observationRevision: UInt64 = 0
++    static private(set) var pending: NativeFocusRequest?
++    private static var deadline: Task<Void, Never>?
++
++    static func begin(windowId: UInt32, pid: pid_t) -> UInt64 {
++        generation &+= 1
++        observationRevision &+= 1
++        deadline?.cancel()
++        let token = generation
++        pending = NativeFocusRequest(generation: token, windowId: windowId, pid: pid,
++            sourcePid: NSWorkspace.shared.frontmostApplication?.processIdentifier,
++            started: ProcessInfo.processInfo.systemUptime)
++        NSLog("AeroSpace focus request=%llu window=%u pid=%d", token, windowId, pid)
++        // Failure deadline, not a focus debounce: a matching AX observation
++        // completes immediately; a refused activation must not pin focus forever.
++        deadline = Task { @MainActor in
++            do { try await Task.sleep(for: .seconds(2)) } catch { return }
++            fail(token, reason: "activation-not-acknowledged")
++        }
++        return token
++    }
++
++    static func fail(_ token: UInt64, reason: String) {
++        guard pending?.generation == token else { return }
++        NSLog("AeroSpace focus request=%llu failed=%@", token, reason)
++        MacApp.cancelNativeFocus()
++        pending = nil
++        observationRevision &+= 1
++        deadline?.cancel()
++        invalidateNativeFocusCache()
++        if !isUnitTest { scheduleCancellableCompleteRefreshSession(.ax("native-focus-failed")) }
++    }
++
++    static func userInput(timestamp: TimeInterval) {
++        if let request = pending, timestamp > request.started {
++            fail(request.generation, reason: "superseded-by-user-input")
++        }
++    }
++
++    static func accept(_ window: Window?) -> Bool {
++        guard let request = pending else { return true }
++        guard Window.get(byId: request.windowId) != nil else {
++            fail(request.generation, reason: "target-closed")
++            return true
++        }
++        let pid = window?.app.pid ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
++        switch request.observe(windowId: window?.windowId, pid: pid) {
++            case .acknowledge:
++                NSLog("AeroSpace focus request=%llu acknowledged window=%u", request.generation, request.windowId)
++                pending = nil
++                observationRevision &+= 1
++                deadline?.cancel()
++                return true
++            case .intermediate:
++                return false
++            case .superseded:
++                fail(request.generation, reason: "another-application-activated")
++                return true
++        }
++    }
++}
+--- /dev/null
++++ b/Sources/AppBundle/nativeWindowFocus.swift
+@@ -0,0 +1,32 @@
++import AppKit
++
++// An obsolete request must not finish raising its window after a newer one
++// has been submitted. Never fall back to application-wide activation.
++func performNativeWindowFocus(
++    _ job: RunLoopJob,
++    makeMain: () -> Void,
++    makeKey: () throws -> CGError,
++    raise: () -> Void,
++) throws -> CGError {
++    try job.checkCancellation()
++    makeMain()
++    try job.checkCancellation()
++    let result = try makeKey()
++    guard result == .success else { return result }
++    try job.checkCancellation()
++    raise()
++    return .success
++}
++
++// Separate a same-process key-window handoff from application activation.
++// Every phase is cancellable; an old request must not select after a newer one.
++func performKeyWindowHandoff(_ job: RunLoopJob,
++    resign: () -> CGError, settle: () -> Void, select: () -> CGError
++) throws -> CGError {
++    try job.checkCancellation()
++    let result = resign()
++    guard result == .success else { return result }
++    settle()
++    try job.checkCancellation()
++    return select()
++}
+--- a/Sources/AppBundle/tree/MacApp.swift
++++ b/Sources/AppBundle/tree/MacApp.swift
+@@ -1,5 +1,6 @@
+ import AppKit
+ import Common
++import PrivateApi
+ 
+ // Potential alternative implementation
+ // https://github.com/swiftlang/swift-evolution/blob/main/proposals/0392-custom-actor-executors.md
+@@ -127,22 +128,32 @@
+         return try await MacWindow.getOrRegister(windowId: windowId, macApp: self)
+     }
+ 
+-    @MainActor func nativeFocus(_ windowId: UInt32) {
++    @MainActor static func cancelNativeFocus() { focusJob?.cancel() }
++
++    @MainActor func nativeFocus(_ windowId: UInt32, raise: Bool = true) {
+         if serverArgs.isReadOnly { return }
+         MacApp.focusJob?.cancel()
+-        // Performance optimization. If possible avoid doing AX requests
+-        // (important for apps which are slow at responding even such basic AX requests. E.g. Godot)
+-        // Beware of the macOS bug: https://github.com/nikitabobko/AeroSpace/issues/101
+-        if (!NSScreen.screensHaveSeparateSpaces || monitors.count == 1) &&
+-            (lastNativeFocusedWindowId == windowId || windowsCount == 1)
+-        {
+-            nsApp.activate(options: .activateIgnoringOtherApps)
+-        } else {
+-            MacApp.focusJob = withWindowAsync(windowId, .cancellable) { [nsApp] window, job in
+-                // Raise firstly to make sure that by the time we activate the app, the window would be already on top
+-                window.set(Ax.isMainAttr, true)
+-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+-                nsApp.activate(options: .activateIgnoringOtherApps)
++        let token = NativeFocusCoordinator.begin(windowId: windowId, pid: pid)
++        MacApp.focusJob = withWindowAsync(windowId, .cancellable) { [pid, nsApp, axApp] window, job in
++            let result = try performNativeWindowFocus(job,
++                makeMain: { if raise { window.set(Ax.isMainAttr, true) } },
++                makeKey: {
++                    if !raise, nsApp.isActive,
++                       let old = axApp.threadGuarded.get(Ax.focusedWindowAttr)?.windowId, old != windowId {
++                        let result = try performKeyWindowHandoff(job,
++                            resign: { aeroPostKeyWindowEvent(pid, old, false) },
++                            // macOS key-event compatibility: the same separation
++                            // used by yabai. This is not a workspace debounce.
++                            settle: { Thread.sleep(forTimeInterval: 0.040) },
++                            select: { aeroPostKeyWindowEvent(pid, windowId, true) })
++                        guard result == .success else { return result }
++                    }
++                    try job.checkCancellation()
++                    return aeroMakeKeyWindow(pid, windowId)
++                },
++                raise: { if raise { AXUIElementPerformAction(window, kAXRaiseAction as CFString) } })
++            if result != .success {
++                Task { @MainActor in NativeFocusCoordinator.fail(token, reason: "native-error-\(result.rawValue)") }
+             }
+         }
+     }
+--- a/Sources/AppBundle/tree/MacWindow.swift
++++ b/Sources/AppBundle/tree/MacWindow.swift
+@@ -109,8 +109,8 @@
+     override func isMacosFullscreen(_ cm: CancellationMode) async throws -> Bool { try await macApp.isMacosNativeFullscreen(windowId, cm) == true }
+     override func isMacosMinimized(_ cm: CancellationMode) async throws -> Bool { try await macApp.isMacosNativeMinimized(windowId, cm) == true }
+ 
+-    @MainActor override func nativeFocus() {
+-        macApp.nativeFocus(windowId)
++    @MainActor override func nativeFocus(raise: Bool = true) {
++        macApp.nativeFocus(windowId, raise: raise)
+     }
+ 
+     override func closeAxWindow() {
+--- a/Sources/AppBundle/tree/Window.swift
++++ b/Sources/AppBundle/tree/Window.swift
+@@ -35,7 +35,7 @@
+     func isMacosFullscreen(_ cm: CancellationMode) async throws -> Bool { false }
+     func isMacosMinimized(_ cm: CancellationMode) async throws -> Bool { false } // todo replace with enum MacOsWindowNativeState { normal, fullscreen, invisible }
+     var isHiddenInCorner: Bool { die("Not implemented") }
+-    @MainActor func nativeFocus() { die("Not implemented") }
++    @MainActor func nativeFocus(raise: Bool = true) { die("Not implemented") }
+     func getAxRect(_ cm: CancellationMode) async throws -> Rect? { die("Not implemented") }
+     func getCenter(_ cm: CancellationMode) async throws -> CGPoint? { try await getAxRect(cm)?.center }
+ 
+--- /dev/null
++++ b/Sources/AppBundleTests/NativeFocusRequestTest.swift
+@@ -0,0 +1,52 @@
++@testable import AppBundle
++import XCTest
++
++final class NativeFocusRequestTest: XCTestCase {
++    private let request = NativeFocusRequest(generation: 2, windowId: 2257, pid: 10, sourcePid: 20, started: 1)
++    func testTargetAcknowledges() {
++        XCTAssertEqual(request.observe(windowId: 2257, pid: 10), .acknowledge)
++    }
++    func testOldWindowInTargetAppIsIntermediate() {
++        XCTAssertEqual(request.observe(windowId: 2260, pid: 10), .intermediate)
++    }
++    func testPreviousAppIsIntermediate() {
++        XCTAssertEqual(request.observe(windowId: 5518, pid: 20), .intermediate)
++    }
++    func testMissingWindowDoesNotAcknowledge() {
++        XCTAssertEqual(request.observe(windowId: nil, pid: 10), .intermediate)
++        XCTAssertEqual(request.observe(windowId: nil, pid: nil), .intermediate)
++    }
++    func testUnrelatedAppSupersedes() {
++        XCTAssertEqual(request.observe(windowId: 654, pid: 30), .superseded)
++    }
++}
++
++@MainActor final class NativeFocusCoordinatorTest: XCTestCase {
++    override func setUp() async throws { setUpWorkspacesForTests() }
++    override func tearDown() async throws {
++        if let request = NativeFocusCoordinator.pending {
++            NativeFocusCoordinator.fail(request.generation, reason: "test-cleanup")
++        }
++    }
++    func testStaleFailureCannotCancelNewRequest() {
++        let revision = NativeFocusCoordinator.observationRevision
++        let old = NativeFocusCoordinator.begin(windowId: 1, pid: 10)
++        XCTAssertNotEqual(revision, NativeFocusCoordinator.observationRevision)
++        let new = NativeFocusCoordinator.begin(windowId: 2, pid: 10)
++        NativeFocusCoordinator.fail(old, reason: "old-error")
++        XCTAssertEqual(NativeFocusCoordinator.pending?.generation, new)
++    }
++    func testOnlyNewUserInputCancelsRequest() {
++        let token = NativeFocusCoordinator.begin(windowId: 1, pid: 10)
++        let started = NativeFocusCoordinator.pending!.started
++        NativeFocusCoordinator.userInput(timestamp: started - 0.1)
++        XCTAssertEqual(NativeFocusCoordinator.pending?.generation, token)
++        NativeFocusCoordinator.userInput(timestamp: started + 0.1)
++        XCTAssertNil(NativeFocusCoordinator.pending)
++    }
++    func testDestroyedTargetReleasesRequest() {
++        _ = NativeFocusCoordinator.begin(windowId: 999999, pid: 10)
++        XCTAssertTrue(NativeFocusCoordinator.accept(nil))
++        XCTAssertNil(NativeFocusCoordinator.pending)
++    }
++}
+--- /dev/null
++++ b/Sources/AppBundleTests/NativeWindowFocusTest.swift
+@@ -0,0 +1,65 @@
++@testable import AppBundle
++import AppKit
++import Common
++import XCTest
++
++final class NativeWindowFocusTest: XCTestCase {
++    func testTargetsWindowBeforeRaising() throws {
++        var events: [String] = []
++        let result = try performNativeWindowFocus(RunLoopJob(.cancellable),
++            makeMain: { events.append("main") },
++            makeKey: { events.append("key"); return .success },
++            raise: { events.append("raise") })
++        XCTAssertEqual(result, .success)
++        XCTAssertEqual(events, ["main", "key", "raise"])
++    }
++
++    func testCancelledRequestDoesNothing() {
++        let job = RunLoopJob(.cancellable)
++        job.cancel()
++        XCTAssertThrowsError(try performNativeWindowFocus(job,
++            makeMain: { XCTFail("cancelled") }, makeKey: { XCTFail("cancelled"); return .success },
++            raise: { XCTFail("cancelled") }))
++    }
++
++    func testCancellationDuringMainSelectionStopsActivation() {
++        let job = RunLoopJob(.cancellable)
++        XCTAssertThrowsError(try performNativeWindowFocus(job,
++            makeMain: { job.cancel() }, makeKey: { XCTFail("obsolete activation"); return .success },
++            raise: { XCTFail("obsolete raise") }))
++    }
++
++    func testCancellationDuringActivationStopsRaise() {
++        let job = RunLoopJob(.cancellable)
++        XCTAssertThrowsError(try performNativeWindowFocus(job,
++            makeMain: {}, makeKey: { job.cancel(); return .success },
++            raise: { XCTFail("obsolete raise") }))
++    }
++
++    func testFailedActivationDoesNotRaiseOrReactivateApp() throws {
++        let result = try performNativeWindowFocus(RunLoopJob(.cancellable),
++            makeMain: {}, makeKey: { .cannotComplete }, raise: { XCTFail("failed activation") })
++        XCTAssertEqual(result, .cannotComplete)
++    }
++
++    func testKeyHandoffOrdersLossBeforeSelection() throws {
++        var events: [String] = []
++        let result = try performKeyWindowHandoff(RunLoopJob(.cancellable),
++            resign: { events.append("resign"); return .success },
++            settle: { events.append("settle") },
++            select: { events.append("select"); return .success })
++        XCTAssertEqual(result, .success)
++        XCTAssertEqual(events, ["resign", "settle", "select"])
++    }
++    func testNewRequestDuringHandoffPreventsStaleSelection() {
++        let job = RunLoopJob(.cancellable)
++        XCTAssertThrowsError(try performKeyWindowHandoff(job,
++            resign: { .success }, settle: { job.cancel() },
++            select: { XCTFail("obsolete selection"); return .success }))
++    }
++    func testFailedResignationDoesNotSelect() throws {
++        XCTAssertEqual(try performKeyWindowHandoff(RunLoopJob(.cancellable),
++            resign: { .cannotComplete }, settle: { XCTFail("failed") },
++            select: { XCTFail("failed"); return .success }), .cannotComplete)
++    }
++}
+--- a/Sources/AppBundleTests/command/FocusCommandTest.swift
++++ b/Sources/AppBundleTests/command/FocusCommandTest.swift
+@@ -23,6 +23,14 @@
+ final class FocusCommandTest: XCTestCase {
+     override func setUp() async throws { setUpWorkspacesForTests() }
+ 
++    func testNoRaiseRequiresAnExactWindow() {
++        var expected = FocusCmdArgs(rawArgs: [], windowId: 42)
++        expected.noRaise = true
++        testParseSingleCommandSucc("focus --window-id 42 --no-raise", expected)
++        XCTAssertNotNil(parseCommand("focus left --no-raise").errorOrNil)
++        XCTAssertNotNil(parseCommand("focus --dfs-index 1 --no-raise").errorOrNil)
++    }
++
+     func testParse() {
+         XCTAssertTrue(parseCommand("focus --boundaries left").errorOrNil?.contains("Possible values") == true)
+         var expected = FocusCmdArgs(rawArgs: [], cardinalOrDfsDirection: .direction(.left))
+--- a/Sources/AppBundleTests/tree/TestWindow.swift
++++ b/Sources/AppBundleTests/tree/TestWindow.swift
+@@ -22,7 +22,7 @@
+     nonisolated var description: String { "TestWindow(\(windowId))" }
+ 
+     @MainActor
+-    override func nativeFocus() {
++    override func nativeFocus(raise: Bool = true) {
+         appForTests = TestApp.shared
+         TestApp.shared.focusedWindow = self
+     }
+--- a/Sources/Common/cmdArgs/impl/FocusCmdArgs.swift
++++ b/Sources/Common/cmdArgs/impl/FocusCmdArgs.swift
+@@ -6,6 +6,7 @@
+         help: focus_help_generated,
+         flags: [
+             "--ignore-floating": falseBoolFlag(\.floatingAsTiling),
++            "--no-raise": trueBoolFlag(\.noRaise),
+             "--window-id": windowIdSubArgParser(),
+             "--dfs-index": singleValueSubArgParser(\.dfsIndex, "<dfs-index>", parseUInt32),
+ 
+@@ -30,6 +31,7 @@
+     public var dfsIndex: UInt32? = nil
+     public var cardinalOrDfsDirection: CardinalOrDfsDirection? = nil
+     public var floatingAsTiling: Bool = true
++    public var noRaise: Bool = false
+ 
+     public init(rawArgs: StrArrSlice, cardinalOrDfsDirection: CardinalOrDfsDirection) {
+         self.commonState = .init(rawArgs)
+@@ -106,7 +108,10 @@
+             $0.cardinalOrDfsDirection != nil || $0.windowId != nil || $0.dfsIndex != nil
+         }
+         .filter("--window-id is incompatible with other options") {
+-            $0.windowId == nil || $0 == FocusCmdArgs(rawArgs: args, windowId: $0.windowId.orDie())
++            if $0.windowId == nil { return !$0.noRaise }
++            var expected = FocusCmdArgs(rawArgs: args, windowId: $0.windowId.orDie())
++            expected.noRaise = $0.noRaise
++            return $0 == expected
+         }
+         .filter("--dfs-index is incompatible with other options") {
+             $0.dfsIndex == nil || $0 == FocusCmdArgs(rawArgs: args, dfsIndex: $0.dfsIndex.orDie())
+--- a/Sources/PrivateApi/include/private.h
++++ b/Sources/PrivateApi/include/private.h
+@@ -25,4 +25,9 @@
+ // func _AXUIElementGetWindow(_ axUiElement: AXUIElement, _ id: inout CGWindowID) -> AXError
+ AXError _AXUIElementGetWindow(AXUIElementRef element, uint32_t *identifier);
+ 
++// Window-specific activation; unlike NSRunningApplication.activate this does
++// not let AppKit choose another key window on a different monitor.
++CGError aeroMakeKeyWindow(pid_t pid, uint32_t wid);
++CGError aeroPostKeyWindowEvent(pid_t pid, uint32_t wid, bool active);
++
+ #endif
+--- a/Sources/PrivateApi/include/private.m
++++ b/Sources/PrivateApi/include/private.m
+@@ -1,2 +1,46 @@
+-// This file exists purely because xcode doesn't like header only targets, SPM is fine with them
+ #import "private.h"
++#import <Carbon/Carbon.h>
++#import <string.h>
++
++// WindowServer key-window protocol shared with yabai/Amethyst.
++// See AeroSpace issue #101 and proposed upstream fix #2179.
++extern CGError _SLPSSetFrontProcessWithOptions(ProcessSerialNumber *, uint32_t, uint32_t);
++extern CGError SLPSPostEventRecordTo(ProcessSerialNumber *, uint8_t *);
++
++CGError aeroMakeKeyWindow(pid_t pid, uint32_t wid) {
++    if (pid <= 0 || wid == 0) return kCGErrorIllegalArgument;
++    ProcessSerialNumber psn = {0};
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    OSStatus status = GetProcessForPID(pid, &psn);
++#pragma clang diagnostic pop
++    if (status != noErr) return kCGErrorCannotComplete;
++    CGError error = _SLPSSetFrontProcessWithOptions(&psn, wid, 0x200);
++    if (error != kCGErrorSuccess) return error;
++    uint8_t bytes[0xf8] = {0};
++    bytes[0x04] = 0xf8;
++    bytes[0x3a] = 0x10;
++    memcpy(bytes + 0x3c, &wid, sizeof(wid));
++    memset(bytes + 0x20, 0xff, 0x10);
++    bytes[0x08] = 0x01;
++    error = SLPSPostEventRecordTo(&psn, bytes);
++    if (error != kCGErrorSuccess) return error;
++    bytes[0x08] = 0x02;
++    return SLPSPostEventRecordTo(&psn, bytes);
++}
++
++CGError aeroPostKeyWindowEvent(pid_t pid, uint32_t wid, bool active) {
++    if (pid <= 0 || wid == 0) return kCGErrorIllegalArgument;
++    ProcessSerialNumber psn = {0};
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    OSStatus status = GetProcessForPID(pid, &psn);
++#pragma clang diagnostic pop
++    if (status != noErr) return kCGErrorCannotComplete;
++    uint8_t bytes[0xf8] = {0};
++    bytes[0x04] = 0xf8;
++    bytes[0x08] = 0x0d;
++    bytes[0x8a] = active ? 0x01 : 0x02;
++    memcpy(bytes + 0x3c, &wid, sizeof(wid));
++    return SLPSPostEventRecordTo(&psn, bytes);
++}

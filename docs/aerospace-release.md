@@ -3,11 +3,26 @@
 Use this optional path when you intentionally maintain a local AeroSpace patch.
 The default Omacosy installation still uses the upstream Homebrew cask.
 
-The checked-in patch rereads native focus after 100 ms when an app activation
-initially reports a window on a hidden workspace. This avoids revealing another
-monitor's workspace during a transient Edge activation. It does not raise windows.
-Three upstream regression tests cover transient, deliberate hidden, and visible
-focus. This delay is a bounded mitigation, not a guarantee for arbitrarily slow apps.
+The patch makes AeroSpace the owner of requested window focus. It activates the
+specific native window instead of calling application-wide activation, and waits
+for an observation of that target before accepting intermediate focus changes.
+An acknowledgement completes immediately. A failed request expires after two
+seconds, cancels its native job, and refreshes actual focus; it does not bounce a
+workspace back. Native reads spanning a request change are reread.
+
+The Omacosy mouse helper submits `focus --window-id ID --no-raise` asynchronously.
+That option only accepts visible windows and requires the matching patched app
+and CLI. The helper no longer activates applications independently. The old
+`omacosy-focus-guard` workspace hook is retired.
+
+No-raise focus is a macOS compatibility boundary, not a public API guarantee.
+The backend uses the WindowServer key-window protocol. For two windows in one
+active process, it separates key loss and key gain by 40 ms, as
+[yabai does](https://github.com/koekeishiya/yabai/blob/master/src/window_manager.c).
+Removing that separation loses some Edge transitions; selecting AXMain instead
+raises the browser over other windows. Cancellation is checked before selecting
+the new window. The 40 ms applies only to this native handoff, not workspace
+observation or a retry loop. Keep this limitation explicit when adopting the patch.
 
 ## Build and inspect
 
@@ -45,7 +60,9 @@ CLI, and configuration as a rollback. A running video or native fullscreen sessi
 is a reason to defer activation.
 
 Quit the old AeroSpace, install the verified app at /Applications/AeroSpace.app,
-then install its matching CLI and start exactly one manager. Restore each saved
+then install its matching CLI and start exactly one manager. Wait for the saved
+normal window IDs to register; a working socket alone is insufficient. Inactive
+native tabs may not be separate live windows. Restore each saved
 window ID with move-node-to-workspace --window-id, then restore visible workspaces
 and focus. Review your startup hooks before doing this: layout helpers must not
 overwrite geometry before membership is restored. This tool intentionally does

@@ -494,7 +494,10 @@ link "$REPO_DIR/bin/theme-bg-next" "$HOME/.local/bin/theme-bg-next"
 link "$REPO_DIR/bin/omacosy-toggle" "$HOME/.local/bin/omacosy-toggle"
 link "$REPO_DIR/bin/omacosy-files" "$HOME/.local/bin/omacosy-files"
 link "$REPO_DIR/bin/omacosy-ws" "$HOME/.local/bin/omacosy-ws"
-link "$REPO_DIR/bin/omacosy-focus-guard" "$HOME/.local/bin/omacosy-focus-guard"
+# Remove only the retired Omacosy-owned link; never a user's replacement.
+if [ "$(readlink "$HOME/.local/bin/omacosy-focus-guard" 2>/dev/null || true)" = "$REPO_DIR/bin/omacosy-focus-guard" ]; then
+  rm "$HOME/.local/bin/omacosy-focus-guard"
+fi
 link "$REPO_DIR/bin/omacosy-ws-collapse" "$HOME/.local/bin/omacosy-ws-collapse"
 link "$REPO_DIR/bin/omacosy-update" "$HOME/.local/bin/omacosy-update"
 link "$REPO_DIR/bin/omacosy-spawn" "$HOME/.local/bin/omacosy-spawn"

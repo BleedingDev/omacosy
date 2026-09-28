@@ -1,7 +1,7 @@
 // omacosy-ffm — focus follows mouse for the omacosy tiling setup.
 // Event-driven: a global mouseMoved monitor (rides the Accessibility
 // grant this binary needs anyway) hit-tests the topmost normal window
-// under the cursor and focuses its exact window ID via SkyLight key-window events.
+// under the cursor and asks AeroSpace to focus its exact window ID without raising it.
 // Hover changes the key window without raising it. A parked cursor
 // generates no events and cannot steal focus from a launching window.
 //
@@ -13,68 +13,29 @@
 import AppKit
 import ApplicationServices
 
-// Private SkyLight focus — the route AeroSpace and yabai use. The AX
-// attributes politely no-op for some apps (Arc: every call returns
-// success, nothing happens); SLPS actually moves focus.
-struct PSN { var hi: UInt32 = 0, lo: UInt32 = 0 }
-@_silgen_name("GetProcessForPID")
-func GetProcessForPID(_ pid: pid_t, _ psn: inout PSN) -> OSStatus
-@_silgen_name("_SLPSSetFrontProcessWithOptions")
-func SLPSSetFrontProcess(_ psn: inout PSN, _ wid: UInt32, _ mode: UInt32) -> Int32
-@_silgen_name("SLPSPostEventRecordTo")
-func SLPSPostEvent(_ psn: inout PSN, _ bytes: UnsafeMutablePointer<UInt8>) -> Int32
-
 @_silgen_name("_AXUIElementGetWindow")
 func AXWindowID(_ element: AXUIElement, _ wid: UnsafeMutablePointer<UInt32>) -> AXError
 
-let kCPSUserGenerated: UInt32 = 0x200
-
-// Use the window-ID key-event path used by yabai's no-raise focus.
-// AXMain writes and ordinary app activation can reorder windows. Neither
-// belongs on the hover path. Source: koekeishiya/yabai, window_manager.c.
-func slpsFocus(pid: pid_t, wid: UInt32) -> Bool {
-    let app = AXUIElementCreateApplication(pid)
-    AXUIElementSetMessagingTimeout(app, 0.2)
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-          let windows = value as? [AXUIElement], windows.contains(where: {
-              var id: UInt32 = 0
-              return AXWindowID($0, &id) == .success && id == wid
-          }) else { return false }
-    var psn = PSN()
-    guard GetProcessForPID(pid, &psn) == noErr else { return false }
-    var bytes = [UInt8](repeating: 0, count: 0xf8)
-    func select(_ id: UInt32) {
-        var id = id
-        withUnsafeBytes(of: &id) { src in
-            for i in 0..<4 { bytes[0x3c + i] = src[i] }
+// AeroSpace owns both the focus request and its native acknowledgement.
+// Never activate an application independently of the workspace model.
+var focusProcess: Process?
+func requestHoverFocus(wid: UInt32, completion: @escaping (Bool) -> Void) {
+    guard focusProcess == nil else { completion(false); return }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/aerospace")
+    process.arguments = ["focus", "--window-id", String(wid), "--no-raise"]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    process.terminationHandler = { child in
+        DispatchQueue.main.async {
+            guard focusProcess === child else { return }
+            focusProcess = nil
+            completion(child.terminationStatus == 0)
         }
     }
-    // Two windows in one process need an explicit key-window handoff.
-    if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-       AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
-       let value, CFGetTypeID(value) == AXUIElementGetTypeID() {
-        var old: UInt32 = 0
-        if AXWindowID(value as! AXUIElement, &old) == .success, old != wid {
-            bytes[0x04] = 0xf8; bytes[0x08] = 0x0d; bytes[0x8a] = 0x02
-            select(old)
-            bytes.withUnsafeMutableBufferPointer { _ = SLPSPostEvent(&psn, $0.baseAddress!) }
-            usleep(40_000) // The native key handoff requires distinct events.
-            bytes[0x8a] = 0x01
-            select(wid)
-            bytes.withUnsafeMutableBufferPointer { _ = SLPSPostEvent(&psn, $0.baseAddress!) }
-        }
-    }
-    guard SLPSSetFrontProcess(&psn, wid, kCPSUserGenerated) == 0 else { return false }
-    bytes = [UInt8](repeating: 0, count: 0xf8)
-    bytes[0x04] = 0xf8; bytes[0x3a] = 0x10
-    select(wid)
-    for i in 0x20..<0x30 { bytes[i] = 0xff }
-    bytes[0x08] = 0x01
-    let down = bytes.withUnsafeMutableBufferPointer { SLPSPostEvent(&psn, $0.baseAddress!) }
-    bytes[0x08] = 0x02
-    let up = bytes.withUnsafeMutableBufferPointer { SLPSPostEvent(&psn, $0.baseAddress!) }
-    return down == 0 && up == 0
+    focusProcess = process
+    do { try process.run() }
+    catch { focusProcess = nil; completion(false) }
 }
 
 // Apps that hover must never focus (omarchy's JetBrains-style
@@ -99,9 +60,7 @@ let ignoredApps: Set<String> = {
 let processMinInterval = 0.04 // hit-test at most ~25Hz during motion
 let dwellSeconds = 0.10 // hover this long over a new window to focus it
 
-var lastKey = ""
 var pendingKey = ""
-var lastFocusAt = 0.0
 var lastProcessAt = 0.0
 var dwellWork: DispatchWorkItem? = nil
 
@@ -274,41 +233,34 @@ func process(confirmed: Bool) {
     // judge "already focused" by reality, not our own bookkeeping — a
     // silently failed focus attempt must be retried, not remembered
     let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
-    if hit.pid == frontPid && hit.key == lastKey {
+    let app = AXUIElementCreateApplication(hit.pid)
+    AXUIElementSetMessagingTimeout(app, 0.1)
+    var focusedValue: CFTypeRef?
+    var focusedID: UInt32 = 0
+    if hit.pid == frontPid,
+       AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedValue) == .success,
+       let focusedValue, CFGetTypeID(focusedValue) == AXUIElementGetTypeID(),
+       AXWindowID(focusedValue as! AXUIElement, &focusedID) == .success,
+       focusedID == hit.wid {
         pendingKey = ""
         dwellWork?.cancel()
         return
     }
-    let now = CFAbsoluteTimeGetCurrent()
     if confirmed, hit.key == pendingKey {
-        // cooldown: never two focus changes within 250ms — breaks any
-        // residual feedback loop with the window manager
-        if now - lastFocusAt > 0.25 {
-            // hover focus IS user intent (it's movement-gated), but it
-            // emits no key/click CGEvent — stamp the focus guard's
-            // intent file or a cross-monitor hover (focused-workspace
-            // change) otherwise gets bounced as an "app yank".
-            FileManager.default.createFile(
-                atPath: "/tmp/omacosy-user-intent-\(getuid())", contents: nil)
-            let focusID = UUID().uuidString
-            let focusContext: [String: Any] = ["focus_request": focusID, "id": Int(hit.wid), "pid": Int(hit.pid),
-                "front_pid": Int(frontPid), "cursor": [e.location.x, e.location.y],
-                "target_frame": diagnosticRect(hit.rect), "stack": diagnosticNativeStack()]
-            WindowDiagnostics.shared.record("ffm.focus.begin", focusContext)
-            let accepted = slpsFocus(pid: hit.pid, wid: hit.wid)
-            WindowDiagnostics.shared.record("ffm.focus.end", ["focus_request": focusID, "id": Int(hit.wid),
-                "pid": Int(hit.pid), "api_accepted": accepted,
+        pendingKey = ""
+        guard focusProcess == nil else { return }
+        let focusID = UUID().uuidString
+        WindowDiagnostics.shared.record("ffm.focus.begin", [
+            "focus_request": focusID, "id": Int(hit.wid), "pid": Int(hit.pid),
+            "front_pid": Int(frontPid), "cursor": [e.location.x, e.location.y],
+            "target_frame": diagnosticRect(hit.rect), "stack": diagnosticNativeStack()])
+        requestHoverFocus(wid: hit.wid) { accepted in
+            WindowDiagnostics.shared.record("ffm.focus.end", [
+                "focus_request": focusID, "id": Int(hit.wid), "pid": Int(hit.pid),
+                "manager_accepted": accepted,
                 "front_pid": Int(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1),
                 "stack": diagnosticNativeStack()])
-            if accepted {
-                lastFocusAt = now
-                lastKey = hit.key
-                DistributedNotificationCenter.default().postNotificationName(
-                    Notification.Name("com.omacosy.window-state"), object: nil,
-                    userInfo: ["kind": "focus", "id": Int(hit.wid)], deliverImmediately: true)
-            }
         }
-        pendingKey = ""
         return
     }
     if hit.key != pendingKey {

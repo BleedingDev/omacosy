@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -40,7 +39,6 @@ class DesktopPolicy(unittest.TestCase):
             path.write_text(STUB)
             path.chmod(0o755)
         self.env = dict(os.environ, OMACOSY_TEST_ROOT=str(self.root), PATH=str(self.bin) + ':' + os.environ['PATH'])
-        self.intent = self.root / ('omacosy-user-intent-' + str(os.getuid()))
 
     def run_policy(self, name, args=(), **scenario):
         (self.root / 'scenario.json').write_text(json.dumps(scenario))
@@ -74,33 +72,15 @@ class DesktopPolicy(unittest.TestCase):
     def test_direct_slot_prefers_primary_over_guest(self):
         calls = self.run_policy('omacosy-ws', ('1',), focused='3', workspaces=['11', '1', '3'])
         self.assertEqual(self.switch_calls(calls), ['1'])
-        self.assertEqual(self.intent.read_text().strip(), '1')
 
     def test_cycle_empty_monitor_is_noop(self):
         calls = self.run_policy('omacosy-ws', ('next', 'next'), focused='1', occupied=[])
         self.assertEqual(self.switch_calls(calls), [])
 
-    def test_stale_guard_cannot_reverse_newer_switch(self):
-        self.env.update(AEROSPACE_FOCUSED_WORKSPACE='2', AEROSPACE_PREV_WORKSPACE='1')
-        calls = self.run_policy('omacosy-focus-guard', focused='4')
-        self.assertEqual(self.switch_calls(calls), [])
-
-    def test_explicit_target_survives_slow_callback(self):
-        self.env.update(AEROSPACE_FOCUSED_WORKSPACE='1', AEROSPACE_PREV_WORKSPACE='2')
-        self.intent.write_text('1\n')
-        os.utime(self.intent, (time.time()-5, time.time()-5))
-        calls = self.run_policy('omacosy-focus-guard', focused='1')
-        self.assertEqual(self.switch_calls(calls), [])
-
-    def test_guard_still_rejects_unrequested_activation(self):
-        self.env.update(AEROSPACE_FOCUSED_WORKSPACE='2', AEROSPACE_PREV_WORKSPACE='1')
-        calls = self.run_policy('omacosy-focus-guard', focused='2', input_age=90)
-        self.assertEqual(self.switch_calls(calls), ['1'])
-
-    def test_real_input_is_not_bounced(self):
-        self.env.update(AEROSPACE_FOCUSED_WORKSPACE='2', AEROSPACE_PREV_WORKSPACE='1')
-        calls = self.run_policy('omacosy-focus-guard', focused='2', input_age=0.1)
-        self.assertEqual(self.switch_calls(calls), [])
+    def test_workspace_hooks_cannot_bounce_focus(self):
+        template = (REPO / 'config/aerospace/aerospace.template.toml').read_text()
+        self.assertNotIn('omacosy-focus-guard', template)
+        self.assertFalse((REPO / 'bin/omacosy-focus-guard').exists())
 
 
 class ExternalConfiguration(unittest.TestCase):
