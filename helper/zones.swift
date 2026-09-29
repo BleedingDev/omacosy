@@ -11,6 +11,7 @@ private struct ZonePlacement: Codable, Equatable {
     var slot: Int
     var free = false
     var maximized = false
+    var anchored: Bool? // Explicit slot selection overrides automatic lone-window centering.
 }
 
 private func zoneRequestedPlacement(_ saved: ZonePlacement?, preferred: Int,
@@ -21,7 +22,7 @@ private func zoneRequestedPlacement(_ saved: ZonePlacement?, preferred: Int,
     case "free": placement.free.toggle()
     case "maximize": placement.maximized.toggle(); placement.free = false
     case "left", "center", "right", "step-left", "step-right":
-        placement.free = false; placement.maximized = false
+        placement.free = false; placement.maximized = false; placement.anchored = true
     default: break
     }
     return placement
@@ -198,6 +199,22 @@ private func zonePreferredSlot(app: String, layout: ZoneLayout) -> Int {
 // Preserve valid saved slots, but repair duplicates deterministically before
 // placing any window. Overflow is allowed only when there are more windows
 // than available zones.
+// A valid placement already visible in a vacant slot is authoritative.
+// This also accepts native macOS snapping, whose vertical frame includes the
+// menu-bar strip. Hidden windows and other monitors are excluded by the caller.
+private func zoneObservedPlacement(_ saved: ZonePlacement, actual: CGRect, area: CGRect,
+                                   layout: ZoneLayout, occupied: Set<Int>) -> ZonePlacement? {
+    guard !saved.free, !saved.maximized else { return nil }
+    guard let slot = (0..<layout.slots).first(where: {
+        let target = zoneTarget(area, slot: $0, layout: layout)
+        return abs(actual.minX - target.minX) <= 2 && abs(actual.width - target.width) <= 2
+    }), slot != saved.slot, !occupied.contains(slot) else { return nil }
+    var result = saved
+    result.slot = slot
+    result.anchored = true
+    return result
+}
+
 private func normalizedSlots(_ members: [(key: String, slot: Int, id: Int, persisted: Bool, preferred: Int)], slots: Int,
                              moving: (key: String, slot: Int)? = nil) -> [String: Int] {
     guard slots > 0 else { return [:] }
@@ -268,6 +285,34 @@ func runZones(_ args: [String]) {
             precondition(zoneTarget(area, slot: 0, layout: .half, centered: count == 1) ==
                          zoneTarget(area, slot: 0, layout: .half, centered: true))
         }
+        // Native snapping moved a saved right-hand browser into a vacant
+        // left slot while another browser occupies the center.
+        let display = CGRect(x: -1796, y: -1440, width: 5120, height: 1440)
+        let left = CGRect(x: -1796, y: -1440, width: 1280, height: 1440)
+        let savedRight = ZonePlacement(slot: 2)
+        let adopted = zoneObservedPlacement(savedRight, actual: left, area: display,
+            layout: .half, occupied: [1])!
+        precondition(adopted.slot == 0 && adopted.anchored == true)
+        let settled = normalizedSlots([
+            (key: "center", slot: 1, id: 2257, persisted: true, preferred: 1),
+            (key: "moved", slot: adopted.slot, id: 13969, persisted: true, preferred: 1)
+        ], slots: 3)
+        precondition(settled["moved"] == 0 && settled["center"] == 1)
+        precondition(zoneObservedPlacement(adopted, actual: left, area: display,
+            layout: .half, occupied: [1]) == nil) // Idempotent next sync.
+        precondition(zoneObservedPlacement(savedRight, actual: left, area: display,
+            layout: .half, occupied: [0, 1]) == nil) // Never steal an occupied slot.
+        precondition(zoneObservedPlacement(ZonePlacement(slot: 2, free: true), actual: left,
+            area: display, layout: .half, occupied: []) == nil)
+        precondition(zoneObservedPlacement(ZonePlacement(slot: 2, maximized: true), actual: left,
+            area: display, layout: .half, occupied: []) == nil)
+        precondition(zoneObservedPlacement(savedRight, actual: left.offsetBy(dx: 30, dy: 0),
+            area: display, layout: .half, occupied: []) == nil) // No fuzzy slot guessing.
+        let legacyPlacement = try! JSONDecoder().decode(ZonePlacement.self,
+            from: Data("{\"slot\":2,\"free\":false,\"maximized\":false}".utf8))
+        precondition(legacyPlacement.anchored == nil)
+        let persistedPlacement = try! JSONDecoder().decode(ZonePlacement.self, from: JSONEncoder().encode(adopted))
+        precondition(persistedPlacement == adopted)
         let repaired = normalizedSlots([
             (key: "edge", slot: 1, id: 5331, persisted: true, preferred: 1),
             (key: "marta", slot: 1, id: 11746, persisted: true, preferred: 0)
@@ -528,6 +573,32 @@ func runZones(_ args: [String]) {
                 (key: key, slot: placement.slot, id: id,
                  persisted: state.windows[key] != nil, preferred: preferred))
         }
+        // Adopt a snapped/moved window before enforcing persisted geometry.
+        // Explicit layout/slot commands use their requested plan instead.
+        if action == "sync" {
+            for (areaKey, originalMembers) in membersByArea {
+                var members = originalMembers
+                for index in members.indices {
+                    let member = members[index]
+                    guard member.persisted, let saved = placements[member.key],
+                          let row = rows.first(where: { $0["window-id"] as? Int == member.id }),
+                          let workspace = row["workspace"] as? String, visible.contains(workspace),
+                          let monitor = row["monitor-name"] as? String, monitor.contains("C49RG9"),
+                          let screen = screenSnapshot.first(where: { $0.name == monitor }),
+                          let window = axWindows[member.id], let actual = zoneRect(window),
+                          zonePhysicalMonitor(actual, screens: screenSnapshot) == monitor else { continue }
+                    let occupied = Set(members.filter { $0.key != member.key && $0.persisted }.map { $0.slot })
+                    guard let adopted = zoneObservedPlacement(saved, actual: actual, area: screen.frame,
+                        layout: state.layout(workspace), occupied: occupied) else { continue }
+                    placements[member.key] = adopted
+                    members[index].slot = adopted.slot
+                    WindowDiagnostics.shared.record("zones.placement.adopt", ["pass": pass,
+                        "id": member.id, "workspace": workspace, "previous_slot": saved.slot,
+                        "slot": adopted.slot, "actual": diagnosticRect(actual), "reason": "visible-vacant-slot"])
+                }
+                membersByArea[areaKey] = members
+            }
+        }
         var slotAssignments: [String: Int] = [:]
         for (area, members) in membersByArea {
             let slots = areaSlots[area] ?? 1
@@ -576,7 +647,7 @@ func runZones(_ args: [String]) {
             let compactSlot = id == focus && ["left", "center", "right", "step-left", "step-right"].contains(action)
                 ? placement.slot : displaySlot
             let target = placement.maximized ? area : (external
-                ? zoneTarget(area, slot: placement.slot, layout: layout, centered: windowCounts[occupancyKey] == 1)
+                ? zoneTarget(area, slot: placement.slot, layout: layout, centered: windowCounts[occupancyKey] == 1 && placement.anchored != true)
                 : zoneCompactTarget(area, slot: compactSlot, count: windowCounts[occupancyKey] ?? 1))
             let needsWrite = row["window-layout"] as? String != "floating" || (zoneRect(window).map { !zoneSame($0, target) } ?? true)
             if action != "status", needsWrite {
