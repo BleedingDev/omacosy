@@ -7,7 +7,110 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
+
+// The focused window's id and frame; id is "" when none is focused.
+static void focused_window(omniwm* c, char* id, size_t idlen, double frame[4])
+{
+	id[0] = 0;
+	frame[0] = frame[1] = frame[2] = frame[3] = -1;
+	char* r = omniwm_request(c, "query", "{\"name\":\"focused-window\",\"selectors\":{},\"fields\":[]}");
+	if (!r) return;
+	yyjson_doc* d = yyjson_read(r, strlen(r), 0);
+	if (d) {
+		yyjson_val* w = yyjson_obj_get(omniwm_payload_of(d), "window");
+		const char* s = yyjson_get_str(yyjson_obj_get(w, "id"));
+		if (s) snprintf(id, idlen, "%s", s);
+		yyjson_val* f = yyjson_obj_get(w, "frame");
+		if (f) {
+			frame[0] = yyjson_get_num(yyjson_obj_get(f, "x"));
+			frame[1] = yyjson_get_num(yyjson_obj_get(f, "y"));
+			frame[2] = yyjson_get_num(yyjson_obj_get(f, "width"));
+			frame[3] = yyjson_get_num(yyjson_obj_get(f, "height"));
+		}
+		yyjson_doc_free(d);
+	}
+	free(r);
+}
+
+// Is the focused window in OmniWM's own fullscreen (Super+F)? The query has
+// no field for it, so the frame decides: tiles never overlap, and a
+// fullscreen window covers every other tile of its workspace. 1 yes, 0 no,
+// -1 no answer. frame gets the focused window's frame.
+static int focused_covers_a_tile(omniwm* c, double frame[4])
+{
+	char* r = omniwm_request(c, "query",
+		"{\"name\":\"windows\",\"selectors\":{},\"fields\":[\"id\",\"frame\",\"mode\",\"workspace\",\"is-focused\",\"hidden-reason\"]}");
+	if (!r) return -1;
+	int yes = -1;
+	yyjson_doc* d = yyjson_read(r, strlen(r), 0);
+	if (d) {
+		yyjson_val* list = yyjson_obj_get(omniwm_payload_of(d), "windows");
+		yyjson_val *w, *me = NULL;
+		size_t i, n;
+		yyjson_arr_foreach(list, i, n, w)
+			if (yyjson_get_bool(yyjson_obj_get(w, "isFocused"))) me = w;
+		const char* mode = me ? yyjson_get_str(yyjson_obj_get(me, "mode")) : NULL;
+		if (me && mode && !strcmp(mode, "tiling")) {
+			yyjson_val* f = yyjson_obj_get(me, "frame");
+			frame[0] = yyjson_get_num(yyjson_obj_get(f, "x"));
+			frame[1] = yyjson_get_num(yyjson_obj_get(f, "y"));
+			frame[2] = yyjson_get_num(yyjson_obj_get(f, "width"));
+			frame[3] = yyjson_get_num(yyjson_obj_get(f, "height"));
+			const char* ws = yyjson_get_str(yyjson_obj_get(yyjson_obj_get(me, "workspace"), "id"));
+			yes = 0;
+			yyjson_arr_foreach(list, i, n, w) {
+				if (w == me) continue;
+				const char* m = yyjson_get_str(yyjson_obj_get(w, "mode"));
+				const char* o = yyjson_get_str(yyjson_obj_get(yyjson_obj_get(w, "workspace"), "id"));
+				if (!m || strcmp(m, "tiling") || !ws || !o || strcmp(ws, o)) continue;
+				yyjson_val* hidden = yyjson_obj_get(w, "hiddenReason");
+				if (hidden && !yyjson_is_null(hidden)) continue;
+				yyjson_val* g = yyjson_obj_get(w, "frame");
+				double x = yyjson_get_num(yyjson_obj_get(g, "x"));
+				double y = yyjson_get_num(yyjson_obj_get(g, "y"));
+				double wd = yyjson_get_num(yyjson_obj_get(g, "width"));
+				double ht = yyjson_get_num(yyjson_obj_get(g, "height"));
+				// contains, not just touches: two tiles passing each other mid-animation overlap, neither holds the other
+				if (wd > 0 && ht > 0 && x >= frame[0] && y >= frame[1]
+					&& x + wd <= frame[0] + frame[2] && y + ht <= frame[1] + frame[3]) {
+					yes = 1;
+					break;
+				}
+			}
+		}
+		yyjson_doc_free(d);
+	}
+	free(r);
+	return yes;
+}
+
+// Is window <id> in macOS's own fullscreen? OmniWM lists it with
+// layout-reason "native-fullscreen"; focused-window has no field for it.
+static int native_fullscreen(omniwm* c, const char* id)
+{
+	int yes = 0;
+	char* r = omniwm_request(c, "query",
+		"{\"name\":\"windows\",\"selectors\":{},\"fields\":[\"id\",\"layout-reason\"]}");
+	if (!r) return 0;
+	yyjson_doc* d = yyjson_read(r, strlen(r), 0);
+	if (d) {
+		yyjson_val* list = yyjson_obj_get(omniwm_payload_of(d), "windows");
+		size_t i, n;
+		yyjson_val* w;
+		yyjson_arr_foreach(list, i, n, w) {
+			const char* why = yyjson_get_str(yyjson_obj_get(w, "layoutReason"));
+			const char* wid = yyjson_get_str(yyjson_obj_get(w, "id"));
+			if (!wid || strcmp(wid, id)) continue;
+			yes = why && !strcmp(why, "native-fullscreen");
+			break;
+		}
+		yyjson_doc_free(d);
+	}
+	free(r);
+	return yes;
+}
 
 static int usage(void)
 {
@@ -16,9 +119,11 @@ static int usage(void)
 		"       omacosy-omni command <name> [args-json]\n"
 		"       omacosy-omni query <name> [fields-csv]      (raw response line)\n"
 		"       omacosy-omni preselect-for-focused [mult]   (down/right by aspect)\n"
+		"       omacosy-omni leave-fullscreen               (Super+F off, tile settled)\n"
 		"       omacosy-omni slot <1-9> [move]               (cursor display's set)\n"
 		"       omacosy-omni focus-window <window-id>\n"
-		"       omacosy-omni window-count | wait-window <baseline> [timeout-ms]\n");
+		"       omacosy-omni window-count | wait-window <baseline> [timeout-ms]\n"
+		"       omacosy-omni focused-id | wait-settled <old-id> [timeout-ms]\n");
 	return 3;
 }
 
@@ -143,6 +248,84 @@ int main(int argc, char** argv)
 	} else if (!strcmp(op, "window-count")) {
 		int n = omniwm_window_count(c);
 		if (n >= 0) printf("%d\n", n); else rc = 1;
+	} else if (!strcmp(op, "leave-fullscreen")) {
+		// A window opened beside a Super+F window lands in that window's
+		// hidden tile, drawn on top, while the fullscreen one stays (OmniWM
+		// 0.7.2). Ending the fullscreen first makes it the ordinary case.
+		//
+		// The wait is a bounded frame check, not a listener, because OmniWM
+		// sends no event for a fullscreen exit. Measured 2026-09-25 (0.7.2,
+		// 1440x900, a 2-tile workspace, 3 runs): with layout-changed, focus and
+		// windows-changed subscribed before toggle-fullscreen, all three stay
+		// silent while the focused frame animates 1424 -> 708 in ~165-200 ms.
+		// layout-changed is published only when the workspace-bar projection
+		// changes (SurfaceReconciler) and by setWorkspaceLayout;
+		// toggleFullscreen only requests a relayout. So poll the focused frame
+		// until it no longer covers a tile and reads the same twice, 1 s cap.
+		double f[4], last[4] = { 0, 0, 0, 0 };
+		if (focused_covers_a_tile(c, f) == 1) {
+			rc = omniwm_command(c, "toggle-fullscreen", NULL) ? 0 : 1;
+			for (int waited = 0; !rc && waited < 1000; waited += 30) {
+				usleep(30000);
+				if (focused_covers_a_tile(c, f) == 0 && !memcmp(f, last, sizeof f)) break;
+				memcpy(last, f, sizeof f);
+			}
+		}
+	} else if (!strcmp(op, "focused-id")) {
+		char id[256];
+		double f[4];
+		focused_window(c, id, sizeof id, f);
+		if (id[0]) printf("%s\n", id); else rc = 1;
+	} else if (!strcmp(op, "wait-settled") && argc > 2) {
+		// The spawn lock's release condition: focus has moved off <old-id> to
+		// the new window, and OmniWM has put that window in its tile.
+		// Focus comes from OmniWM's focus channel, so nothing is asked until
+		// it arrives. The tile does not: all of OmniWM's events arrive once,
+		// as the window appears and before its tile animation (~200 ms), and
+		// none when it ends (measured 2026-09-24, 3 runs). So after the focus
+		// event, a short check of the frame, 30 ms apart, within the timeout:
+		// it must change at least once (a new window first sits where the app
+		// put it), then read the same twice. One that never moves counts after
+		// 400 ms still.
+		int timeout = argc > 3 ? atoi(argv[3]) : 1500;
+		rc = 1;
+		// Nothing to settle: pressed from a window in macOS's own fullscreen
+		// (each new window opens in a Space of its own, with no tile).
+		if (native_fullscreen(c, argv[2])) {
+			rc = 0;
+		} else {
+			struct timeval t0, t1;
+			gettimeofday(&t0, NULL);
+			// or nothing has focus 500 ms in, where the next press from such
+			// a Space starts; on an empty workspace the first window takes
+			// focus well inside that (140-320 ms measured)
+			char* nid = omniwm_wait_focus_change(argv[2], timeout, 500);
+			if (nid && !nid[0]) rc = 0;
+			if (nid && nid[0]) {
+				gettimeofday(&t1, NULL);
+				int left = timeout - (int)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000);
+				char id[256];
+				double f[4], first[4] = { -1, -1, -1, -1 }, lf[4];
+				int moved = 0, still = 0, seen = 0;
+				for (int waited = 0; waited <= left; waited += 30) {
+					focused_window(c, id, sizeof id, f);
+					if (!strcmp(id, nid) && f[2] > 0) {
+						if (!seen) {
+							memcpy(first, f, sizeof f);
+							memcpy(lf, f, sizeof f);
+							seen = 1;
+						} else {
+							if (memcmp(f, first, sizeof f)) moved = 1;
+							still = memcmp(f, lf, sizeof f) ? 0 : still + 30;
+							memcpy(lf, f, sizeof f);
+							if ((moved && still >= 30) || still >= 400) { rc = 0; break; }
+						}
+					}
+					usleep(30000);
+				}
+			}
+			free(nid);
+		}
 	} else if (!strcmp(op, "preselect-for-focused")) {
 		// OmniWM's own orientation rule on the focused tile:
 		// height * multiplier > width -> vertical split -> new goes below

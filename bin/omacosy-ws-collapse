@@ -13,18 +13,30 @@
 # restore: recorded windows go back to their origin workspaces — but
 #   only the ones still sitting where the fold put them. A window the
 #   user moved since is theirs; one that is gone is dropped.
+#
+# A record is keyed by pid:window-id, not OmniWM's opaque id: the
+# opaque id embeds a per-run session UUID, so it is reissued whenever
+# OmniWM starts, and a map keyed on it cannot survive a restart while
+# undocked (measured: macOS 27, OmniWM 0.7.3 — see the pull request).
 export PATH="/opt/homebrew/bin:$PATH"
 
 # a live OmniWM answers its socket in ~3 ms; pgrep -f scanned every
 # process for 31 ms per call, and a stale socket after a crash cannot
 # fool a real request the way a file test could
 wm_is_omniwm() { "$HOME/.local/bin/omacosy-omni" active >/dev/null 2>&1; }
+wm_is_aerospace() { aerospace list-workspaces --focused >/dev/null 2>&1; }
 
 STATE_DIR="$HOME/.local/state/omacosy"
 MAP="$STATE_DIR/collapse-map"
 LOG=/tmp/omacosy-ws-collapse.log
 mkdir -p "$STATE_DIR"
 log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+
+# A move refused for a window still where the fold put it is retried on
+# the next sync, but not for ever: after this many refusals the window
+# stays where it is and the record is dropped. A run with no manager
+# answering exits before the restore, so it does not count as an attempt.
+MAX_ATTEMPTS="${OMACOSY_RESTORE_MAX_ATTEMPTS:-3}"
 
 # `sync N` is the bar's call; the old verbs stay for anything that
 # still says them
@@ -74,7 +86,7 @@ if wm_is_omniwm; then
   fi
 
   if [ "$WANT" = 1 ]; then
-    "$OMNI" query windows id,workspace,app 2>/dev/null | /usr/bin/python3 -c '
+    "$OMNI" query windows id,workspace,app,pid,window-id 2>/dev/null | /usr/bin/python3 -c '
 import sys, json
 wins = json.load(sys.stdin)["result"]["payload"]["windows"]
 used = set(); guests = {}
@@ -84,21 +96,21 @@ for w in wins:
     if not ws.isdigit() or a.startswith("omacosy"): continue
     n = int(ws)
     if n <= 9: used.add(n)
-    else: guests.setdefault(n, []).append(w["id"])
+    else: guests.setdefault(n, []).append((w["id"], str(w["pid"]) + ":" + str(w["windowId"])))
 empty = [s for s in range(1, 10) if s not in used]
 for gws in sorted(guests):
     if empty: t = empty.pop(0)
     elif 1 <= gws % 10 <= 9: t = gws % 10   # 1-9 full: 15 shares 5
     else: continue
-    for wid in guests[gws]:
-        print(f"{wid}\t{t}\t{gws}")
-' | while IFS=$'\t' read -r wid target gws; do
+    for wid, key in guests[gws]:
+        print(f"{wid}\t{t}\t{gws}\t{key}")
+' | while IFS=$'\t' read -r wid target gws key; do
       [ -n "$wid" ] || continue
       if omni_move "$wid" "$target"; then
-        printf '%s\t%s\t%s\n' "$wid" "$gws" "$target" >>"$MAP"
-        log "collapsed (omniwm) $wid $gws -> $target"
+        printf '%s\t%s\t%s\n' "$key" "$gws" "$target" >>"$MAP"
+        log "collapsed (omniwm) $key $gws -> $target"
       else
-        log "collapse: $wid ($gws -> $target) refused"
+        log "collapse: $key ($gws -> $target) refused"
       fi
     done
   else
@@ -108,35 +120,40 @@ for gws in sorted(guests):
     sleep 1
     PLAN="$STATE_DIR/collapse-plan"
     # no answer from OmniWM: keep the map untouched for the next sync
-    "$OMNI" query windows id,workspace 2>/dev/null | /usr/bin/python3 -c '
+    "$OMNI" query windows id,pid,window-id,workspace 2>/dev/null | /usr/bin/python3 -c '
 import sys, json
 wins = json.load(sys.stdin)["result"]["payload"]["windows"]
-where = {w["id"]: (w.get("workspace") or {}).get("rawName") or "" for w in wins}
+now = {}
+for w in wins:
+    ws = (w.get("workspace") or {}).get("rawName") or ""
+    now[str(w["pid"]) + ":" + str(w["windowId"])] = (w["id"], ws)
+    now[w["id"]] = (w["id"], ws)   # a map written before pid:window-id holds an opaque id
 seen = set()
 for line in open(sys.argv[1]):
     f = line.rstrip("\n").split("\t")
     if len(f) < 2 or not f[0] or f[0] in seen: continue
     seen.add(f[0])
-    wid, origin = f[0], f[1]
+    key, origin = f[0], f[1]
     target = f[2] if len(f) > 2 else ""   # maps written before targets were recorded
-    cur = where.get(wid)
-    if cur is None: print(f"gone\t{wid}\t{origin}\t{target}"); continue
-    moved = cur != target if target else not (cur.isdigit() and int(cur) <= 9)
+    cur = now.get(key)
+    if cur is None: print(f"gone\t{key}\t{origin}\t{target}\t"); continue
+    curid, curws = cur
+    moved = curws != target if target else not (curws.isdigit() and int(curws) <= 9)
     verdict = "kept" if moved else "move"
-    print(f"{verdict}\t{wid}\t{origin}\t{target}")
+    print(f"{verdict}\t{key}\t{origin}\t{target}\t{curid}")
 ' "$MAP" >"$PLAN" 2>/dev/null || { log "sync $WANT: no window list from OmniWM, map kept"; rm -f "$PLAN"; exit 1; }
     : >"$MAP.next"
-    while IFS=$'\t' read -r verdict wid origin target; do
+    while IFS=$'\t' read -r verdict key origin target curid; do
       case "$verdict" in
-        gone) log "restore: $wid closed since the fold" ;;
-        kept) log "restore: $wid moved by you since the fold, left alone" ;;
+        gone) log "restore: $key closed since the fold" ;;
+        kept) log "restore: $key moved by you since the fold, left alone" ;;
         move)
-          if omni_move "$wid" "$origin"; then
-            log "restored (omniwm) $wid -> $origin"
+          if omni_move "$curid" "$origin"; then
+            log "restored (omniwm) $key -> $origin"
           else
             # kept: the next sync (wake, replug) tries again
-            printf '%s\t%s\t%s\n' "$wid" "$origin" "$target" >>"$MAP.next"
-            log "restore: $wid -> $origin refused, kept for the next sync"
+            printf '%s\t%s\t%s\n' "$key" "$origin" "$target" >>"$MAP.next"
+            log "restore: $key -> $origin refused, kept for the next sync"
           fi
           ;;
       esac
@@ -149,7 +166,14 @@ for line in open(sys.argv[1]):
   exit 0
 fi
 
-# AeroSpace: unchanged, the bar's sync maps onto the old verbs
+# AeroSpace: the bar's sync maps onto the old verbs. A display change
+# is also when a manager restarts, so if neither answers there is
+# nothing to talk to: keep the map for the next sync instead of
+# consuming it against a manager that is not there.
+if ! wm_is_aerospace; then
+  log "sync $WANT: no window manager answered; map kept"
+  exit 0
+fi
 case "$([ "$WANT" = 1 ] && echo collapse || echo restore)" in
   collapse)
     [ "$(aerospace list-monitors 2>/dev/null | wc -l | tr -d ' ')" = 1 ] || exit 0
@@ -176,7 +200,7 @@ case "$([ "$WANT" = 1 ] && echo collapse || echo restore)" in
       ti=$((ti + 1))
       for wid in $WINS; do
         aerospace move-node-to-workspace --window-id "$wid" "$T" 2>/dev/null &&
-          printf '%s\t%s\n' "$wid" "$gws" >>"$MAP"
+          printf '%s\t%s\t%s\t%s\n' "$wid" "$gws" "$T" 0 >>"$MAP"
       done
       echo "$(date '+%F %T') collapsed $gws -> $T" >>/tmp/omacosy-ws-collapse.log
     done
@@ -223,16 +247,51 @@ case "$([ "$WANT" = 1 ] && echo collapse || echo restore)" in
     # let aerospace finish adopting the reattached monitor (its
     # force-assignment moves the guest workspaces back first)
     sleep 1
-    while IFS=$'\t' read -r wid gws _; do
+    # The same three verdicts as the OmniWM branch. A window is put back
+    # only when it is still where the fold left it: a record whose window
+    # is gone is dropped, one the user moved since is left alone, and a
+    # move refused for a live window is kept for the next sync, up to
+    # MAX_ATTEMPTS refusals. The attempt count is the record's last
+    # field, so it survives in the map between syncs. A window list that
+    # fails to arrive (not an empty one) means the manager is not really
+    # there: change nothing.
+    if ! WHERE="$(aerospace list-windows --all --format '%{window-id}|%{workspace}' 2>/dev/null)"; then
+      log "sync $WANT: no window list from AeroSpace, map kept"
+      mv "$MAP.run" "$MAP" 2>/dev/null
+      exit 1
+    fi
+    : >"$MAP.next"
+    # A non-whitespace separator preserves the empty target in legacy records.
+    while IFS='|' read -r wid gws target attempts; do
       [ -n "$wid" ] && [ -n "$gws" ] || continue
+      cur="$(printf '%s\n' "$WHERE" | awk -F'|' -v id="$wid" '$1 == id { print $2; exit }')"
+      if [ -z "$cur" ]; then
+        log "restore: $wid closed since the fold"
+        continue
+      fi
+      if [ -n "$target" ]; then
+        moved=0; [ "$cur" = "$target" ] || moved=1
+      else
+        # a map written before targets were recorded: a window on a
+        # folded slot (1-9) is assumed still folded
+        moved=1; case "$cur" in [1-9]) moved=0 ;; esac
+      fi
+      if [ "$moved" = 1 ]; then
+        log "restore: $wid moved by you since the fold, left alone"
+        continue
+      fi
       if [ "$(aerospace list-monitors 2>/dev/null | wc -l | tr -d ' ')" -gt 1 ] &&
          aerospace move-node-to-workspace --window-id "$wid" "$gws" 2>/dev/null; then
         echo "$(date '+%F %T') restored $wid -> $gws" >>/tmp/omacosy-ws-collapse.log
       else
-        # A hotplug flap or failed move must not consume the only recovery record.
-        printf '%s\t%s\n' "$wid" "$gws" >> "$MAP"
+        # Keep the local recovery guarantee across repeated refusals and
+        # display flaps. Never consume the only remaining origin record.
+        tries=$(( ${attempts:-0} + 1 ))
+        printf '%s\t%s\t%s\t%s\n' "$wid" "$gws" "$target" "$tries" >>"$MAP.next"
+        log "restore: $wid -> $gws refused, kept for the next sync ($tries)"
       fi
-    done <"$MAP.run"
+    done < <(tr '\t' '|' <"$MAP.run")
+    mv "$MAP.next" "$MAP"
     rm -f "$MAP.run"
     # restored windows land wherever macOS put them, often over the bar
     "$HOME/.local/bin/omacosy-helper" zones sync >>/tmp/omacosy-ws-collapse.log 2>&1

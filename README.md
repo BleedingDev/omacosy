@@ -86,7 +86,7 @@ grant hide themselves rather than half-work.
 
 | Grant | Who asks | What it does | Without it |
 |---|---|---|---|
-| **Accessibility** | AeroSpace *or* OmniWM, `omacosy-gesture`, `omacosy-bar` (reads the focused app's menus for the app-pill popup), `omacosy-ffm` (AeroSpace mode only) | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. | Nothing tiles. Not optional in practice. |
+| **Accessibility** | AeroSpace *or* OmniWM, `omacosy-gesture`, `omacosy-bar` (reads the focused app's menus for the app-pill popup), `omacosy-ffm` (AeroSpace mode only), `omacosy-borders` (optional; hears the ringed window close) | Move, resize and focus other apps' windows. This is the tiling itself, and it is the broadest permission here. The focus ring uses it only to hear an app report that the ringed window is closing. | Nothing tiles. Not optional in practice. Without it for `omacosy-borders` alone, the ring leaves a window closed with Cmd-W about 0.25 s later. |
 | **Input Monitoring** | Karabiner-Elements, `omacosy-gesture` (and OmniWM, under that option) | Karabiner reads keys to remap Caps Lock; `omacosy-gesture` reads raw trackpad contacts, because macOS 26 stopped carrying touch data in normal events. | No Super key, no swipe gestures. |
 | **Screen Recording** | the program that first starts `omacosy-overview` ([see below](#permissions)) | Captures a thumbnail per window for the overview cards, including windows the window manager has stashed offscreen. A screenshot of the visible screen could not see those. | Cards fall back to app icons and titles. |
 | **Bluetooth** | `omacosy-bar` | Reads adapter power and the paired-device list for the bluetooth pill and its menu. | The pill hides itself. |
@@ -123,6 +123,12 @@ something else, and the swipe is the only way in.
   request arrives on; no coordinates are gathered or sent, and the bar
   holds no location API. Delete the weather pill and nothing leaves the
   machine.
+- **The focus ring only listens.** `omacosy-borders` asks for
+  Accessibility to hear an app report that the ringed window is closing.
+  It reads the app's window list and registers for that one report on
+  that one window. It never clicks, types, moves a window or reads what a
+  window shows. Refuse the grant and the ring still works; a window
+  closed with Cmd-W keeps its ring about 0.25 s longer.
 - **omacosy's own binaries never run as root.** `install.sh` uses no
   sudo, installs no LaunchDaemon, and every helper it builds runs as
   you, in your login session.
@@ -142,22 +148,49 @@ something else, and the swipe is the only way in.
   (`/tmp/omacosy-*.log`) carry window titles, app names and workspace
   numbers, never input.
 
-Grants are tied to a binary's code signature. With an Apple Development
-identity present, `install.sh` signs every helper with a stable
-identifier so rebuilds keep their grants; without one, macOS treats
-each rebuild as a new app and you re-grant after every install.
+### Keep your permissions across updates
+
+macOS keeps each permission with the program's code signature. With an
+Apple Development certificate on this Mac, `install.sh` signs every
+helper with it, and an update keeps all your permissions. Without one,
+macOS treats each rebuilt helper as a new app, and you grant its
+permissions again after an update. omacosy works either way, and
+`install.sh` ends with a warning while no certificate signs.
+
+To add a certificate (free, needs an Apple ID):
+
+1. Install Xcode from the App Store and open it once.
+2. Xcode → Settings → Accounts: add your Apple ID.
+3. Select it, then **Manage Certificates → + → Apple Development**.
+4. Run `./install.sh` again, or `omacosy-update`.
+
+You can do this before or after installing omacosy. The next install
+signs with the certificate. macOS then asks once more for each
+permission, because the signature changed; after that, no update asks
+again.
+
+If `install.sh` says the certificate cannot sign because Apple's G3
+certificate is missing, answer `y` when it offers to add it, or add it
+yourself:
+
+```sh
+cd /tmp && curl -fsSLO https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+security add-certificates -k ~/Library/Keychains/login.keychain-db AppleWWDRCAG3.cer
+```
 
 ## App choices
 
 Keybindings launch apps defined in `config/apps.conf`. Defaults are
-Ghostty, Safari, Spotify, Slack (terminal, browser, music, messenger).
-Override any of them in `config/apps.local.conf` (gitignored), then
-re-run `install.sh`:
+Ghostty, Spotify, Slack (terminal, music, messenger). The browser and
+mail chords have no app of their own: they open the macOS **default** web
+browser and mail app, asked at each press, so changing the default in
+System Settings takes effect with no reinstall. Override any app in
+`config/apps.local.conf` (gitignored), then re-run `install.sh`:
 
 ```sh
 # config/apps.local.conf — your picks win over apps.conf
 TERMINAL=Korren
-BROWSER=Arc
+BROWSER=Arc          # pins the browser chord; EMAIL pins the mail chord
 ```
 
 Your personal shell config belongs in `~/.zshrc.local`; the repo's
@@ -200,7 +233,9 @@ Why so much of it is self-built:
 - **JankyBorders** keeps a bitmap per window and costs hundreds of MB.
   `omacosy-borders` strokes one CAShapeLayer that the WindowServer
   rasterizes, driven by SkyLight notifications for focus, move and
-  resize, so the ring glides with drags without polling.
+  resize, so the ring glides with drags without polling. With
+  Accessibility it also hears an app report that the ringed window is
+  closing, so the ring is gone before the window starts to fade.
 - **Mission Control** cannot see AeroSpace's virtual workspaces, so a
   workspace overview cannot be had any other way than
   `omacosy-overview` capturing them itself.
@@ -311,11 +346,32 @@ startup and does no config-file or image-file I/O while it draws.
 - **Floats**: appears only while the workspace holds floating windows;
   click surfaces the next one.
 
+Weather defaults to Celsius and uses the public IP address for location,
+so it follows a VPN exit node. Override either preference without editing
+the repo:
+
+```bash
+omacosy-weather unit fahrenheit
+omacosy-weather location 10001
+omacosy-weather location "Chicago"
+omacosy-weather location auto       # follow the VPN/public IP again
+omacosy-weather status
+```
+
+The command restarts only the bar so the next weather fetch uses the new
+preference immediately. Settings live in `~/.config/omacosy/weather.json`.
+
 ## Keybindings — Super = hold Caps Lock
 
 Karabiner remaps Caps Lock to `cmd+ctrl+alt` (a combo macOS never
 uses), so omarchy's scheme works letter-for-letter without breaking
 typing or app shortcuts. Caps Lock tapped alone is Escape.
+
+A new keyboard whose Caps Lock still toggles caps: Karabiner leaves a
+device alone when it also reports as a pointing device, which many
+Hall-effect and Bluetooth boards do. Turn on **Modify events** for it in
+Karabiner-Elements → Settings → Devices. `install.sh` keeps that switch
+on re-runs and names such keyboards when it finds one connected.
 
 | Chord | Action |
 |---|---|
@@ -337,14 +393,14 @@ typing or app shortcuts. Caps Lock tapped alone is Escape.
 | `Super+t` | toggle floating |
 | `Super+j` | toggle split direction |
 | `Super+-` / `Super+=` | resize |
-| `Super+f` | fullscreen — on notched displays the camera strip is blacked out so it reads as true fullscreen, while the window stays in its workspace (swipes still reach it) |
+| `Super+f` | zoom the focused window inside its workspace — the outer gaps and the bar strip stay, so it reads as one enlarged tile rather than true fullscreen (it stays in its workspace; swipes still reach it) |
 | `Super+n` | native macOS fullscreen (a separate Space — outside the workspace model, avoid unless an app needs it) |
 | `Super+r` | resize mode (`h/j/k/l`, `-`/`=`, `esc`) — AeroSpace only; OmniWM has no binding modes |
 | `Super+shift+;` | service mode (`esc` reload, `r` flatten, `⌫` close others) |
 | **Apps and system** | |
-| `Super+enter` / `Super+shift+enter` | terminal / browser |
+| `Super+enter` / `Super+shift+enter` | terminal / browser (the default browser) |
 | `Super+space` | launcher (Raycast; the OmniWM option opens OmniWM's command palette instead) |
-| `Super+shift+f` / `+m` / `+g` | files / music / messenger (set in `apps.conf`); files opens a NEW Finder window on every press |
+| `Super+shift+f` / `+m` / `+g` / `+e` | files / music / messenger / mail (set in `apps.conf`; mail is the default mail app); files opens a NEW Finder window on every press |
 | `Super+shift+t` | next theme |
 | `Super+shift+y` | yazi, a file manager, in a new Ghostty window (only when yazi is installed) |
 | `Super+shift+b` | next wallpaper of the current theme |
@@ -479,10 +535,11 @@ omacosy-wm-switch aerospace   # the way back, and installs AeroSpace
                               # on first use after ./install.sh --omniwm
 ```
 
-The switch is deliberately paranoid: it snapshots your windows, waits
-for you to grant OmniWM's permissions, and requires you to confirm
-within 90 seconds that workspace switching works — anything else
-reverts to AeroSpace automatically and puts your windows back.
+The switch checks itself: it snapshots your windows, stops AeroSpace,
+starts OmniWM and waits until OmniWM manages them. On a first switch,
+grant OmniWM's permissions when macOS asks. If OmniWM does not take
+over within 2 minutes, or you press Ctrl-C, the switch reverts to
+AeroSpace and puts your windows back.
 
 Under OmniWM everything keeps working — bar, overview (with
 type-to-search), gestures, keybindings, themes — and the dwindle

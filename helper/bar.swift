@@ -1236,6 +1236,7 @@ let bluetoothWatcher = BluetoothWatcher()
 struct Weather {
     var emoji = ""
     var temp = ""
+    var tempUnit = "°C"
     var desc = ""
     var feels = ""
     var low = ""
@@ -1250,6 +1251,31 @@ struct Weather {
 }
 
 var weather: Weather?
+
+struct WeatherPreferences {
+    var fahrenheit = false
+    var location = ""
+}
+
+func loadWeatherPreferences() -> WeatherPreferences {
+    let file = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/omacosy/weather.json")
+    guard let data = try? Data(contentsOf: file),
+          let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return WeatherPreferences() }
+
+    var preferences = WeatherPreferences()
+    if (config["unit"] as? String)?.lowercased() == "fahrenheit" {
+        preferences.fahrenheit = true
+    }
+    if let location = config["location"] as? String {
+        let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed.lowercased() != "auto" {
+            preferences.location = trimmed
+        }
+    }
+    return preferences
+}
 
 // WWO condition code -> glyph, night-aware for the clear/partly pair
 func weatherEmoji(_ code: Int, night: Bool) -> String {
@@ -1281,7 +1307,13 @@ func moonEmoji(_ phase: String) -> String {
 }
 
 func updateWeather() {
-    guard let url = URL(string: "https://wttr.in/?format=j1") else { return }
+    let preferences = loadWeatherPreferences()
+    var components = URLComponents()
+    components.scheme = "https"
+    components.host = "wttr.in"
+    components.path = "/" + preferences.location
+    components.queryItems = [URLQueryItem(name: "format", value: "j1")]
+    guard let url = components.url else { return }
     var request = URLRequest(url: url)
     request.timeoutInterval = 15
     URLSession.shared.dataTask(with: request) { data, _, _ in
@@ -1297,25 +1329,30 @@ func updateWeather() {
         }
 
         var w = Weather()
+        let fahrenheit = preferences.fahrenheit
         let hour = Calendar.current.component(.hour, from: Date())
         w.emoji = weatherEmoji(Int(text(current, "weatherCode")) ?? 0, night: hour < 7 || hour >= 20)
-        w.temp = text(current, "temp_C")
+        w.temp = text(current, fahrenheit ? "temp_F" : "temp_C")
+        w.tempUnit = fahrenheit ? "°F" : "°C"
         w.desc = nested(current, "weatherDesc").lowercased()
-        w.feels = text(current, "FeelsLikeC")
-        w.low = text(today, "mintempC")
-        w.high = text(today, "maxtempC")
+        w.feels = text(current, fahrenheit ? "FeelsLikeF" : "FeelsLikeC")
+        w.low = text(today, fahrenheit ? "mintempF" : "mintempC")
+        w.high = text(today, fahrenheit ? "maxtempF" : "maxtempC")
         w.humidity = text(current, "humidity")
 
         let degrees = Int(text(current, "winddirDegree")) ?? 0
         let arrows = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]
-        w.wind = "\(arrows[((degrees + 180) / 45) % 8]) \(text(current, "windspeedKmph")) km/h"
+        let wind = text(current, fahrenheit ? "windspeedMiles" : "windspeedKmph")
+        w.wind = "\(arrows[((degrees + 180) / 45) % 8]) \(wind) \(fahrenheit ? "mph" : "km/h")"
 
         // rain earns a row only with real signal: falling now, or likely today
-        let precip = Double(text(current, "precipMM")) ?? 0
+        let precipitation = text(current, fahrenheit ? "precipInches" : "precipMM")
+        let precip = Double(precipitation) ?? 0
+        let precipUnit = fahrenheit ? "in" : "mm"
         let chance = ((today["hourly"] as? [[String: Any]]) ?? [])
             .compactMap { Int(($0["chanceofrain"] as? String) ?? "0") }.max() ?? 0
         if precip > 0 {
-            w.rain = "☔ \(text(current, "precipMM"))mm now"
+            w.rain = "☔ \(precipitation)\(precipUnit) now"
             if chance >= 30 { w.rain += " · rain \(chance)% today" }
         } else if chance >= 30 {
             w.rain = "☔ rain \(chance)% today"
@@ -1345,7 +1382,7 @@ func updateWeather() {
 
         DispatchQueue.main.async {
             weather = w
-            set("weather") { $0.icon = ""; $0.label = "\(w.emoji) \(w.temp)°C" }
+            set("weather") { $0.icon = ""; $0.label = "\(w.emoji) \(w.temp)\(w.tempUnit)" }
             if openPopup == "weather" { refreshPopup() }
         }
     }.resume()
@@ -1817,11 +1854,11 @@ func bluetoothRows() -> [PopupRow] {
 
 func weatherRows() -> [PopupRow] {
     guard let w = weather else { return [] }
-    var rows: [PopupRow] = [PopupRow(text: "\(w.emoji) \(w.temp)°C \(w.desc)", hero: true)]
+    var rows: [PopupRow] = [PopupRow(text: "\(w.emoji) \(w.temp)\(w.tempUnit) \(w.desc)", hero: true)]
 
     // feels-like earns a mention only when it differs from the real temp
-    var today = "today \(w.low)° → \(w.high)°C"
-    if w.feels != w.temp { today = "feels \(w.feels)°C · " + today }
+    var today = "today \(w.low)° → \(w.high)\(w.tempUnit)"
+    if w.feels != w.temp { today = "feels \(w.feels)\(w.tempUnit) · " + today }
     rows.append(PopupRow(text: today))
     rows.append(PopupRow(text: "wind \(w.wind) · humidity \(w.humidity)%"))
     if !w.rain.isEmpty { rows.append(PopupRow(text: w.rain)) }
@@ -2605,12 +2642,13 @@ func appIcon(_ name: String) -> NSImage? {
     return icon
 }
 
+// Keep this desktop's bar aligned with its configured 34-point top gap.
 let barHeight: CGFloat = 34
+let barHeightFallback: CGFloat = barHeight
+
 let padLeft: CGFloat = 0
 let chipBox: CGFloat = 20
 let chipPad: CGFloat = 0
-let pillHeight: CGFloat = 34
-let chipPillHeight: CGFloat = 34
 let radius: CGFloat = 0
 let gap: CGFloat = 0
 
@@ -2639,6 +2677,12 @@ final class BarView: NSView {
     var mediaRects: [(String, NSRect)] = []
     var windowTitleRects: [(WindowTitle, NSRect)] = []
     var appleRect: NSRect = .zero
+
+    private var barHeight: CGFloat { surface?.barHeight ?? barHeightFallback }
+    private var pillHeight: CGFloat { barHeight }
+    private var chipPillHeight: CGFloat { barHeight }
+    private var chipIcon: CGFloat { 18 }
+    private var chipRadius: CGFloat { 0 }
 
     override var isFlipped: Bool { false }
 
@@ -2762,10 +2806,12 @@ final class BarView: NSView {
             case .some(.glyph(let glyph)):
                 drawIcon(glyph, iconFont, tint, centeredIn: box)
             case .some(.image(let icon)):
-                icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
+                icon.draw(in: NSRect(x: box.midX - chipIcon / 2, y: (barHeight - chipIcon) / 2,
+                                     width: chipIcon, height: chipIcon))
             case .some(.unavailable), .none:
                 if let app = model.soleApp[ws], let icon = appIcon(app) {
-                    icon.draw(in: NSRect(x: box.midX - 9, y: barHeight / 2 - 9, width: 18, height: 18))
+                    icon.draw(in: NSRect(x: box.midX - chipIcon / 2, y: (barHeight - chipIcon) / 2,
+                                         width: chipIcon, height: chipIcon))
                 } else {
                     draw(surfaces.count == 1 ? ws : String(ws.suffix(1)), chipFont, tint, centeredIn: box)
                 }
@@ -3035,8 +3081,9 @@ final class BarWindow: NSWindow {
 
 // The bar owns the top strip. OMACOSY_BAR_STACK=1 drops it one bar-height
 // so it can run alongside another bar for comparison, which is how this
-// was built.
-let stackOffset: CGFloat = ProcessInfo.processInfo.environment["OMACOSY_BAR_STACK"] == nil ? 0 : barHeight
+// was built. The drop is one STRIP of the display it is on, so the stacked
+// bars of two displays of different strips stay out of each other's menus.
+let barStacked = ProcessInfo.processInfo.environment["OMACOSY_BAR_STACK"] != nil
 
 // One surface per display. Each owns its screen's workspace set and its
 // own window; everything else it reads from the shared model.
@@ -3049,6 +3096,9 @@ final class BarSurface {
     let window: BarWindow
     let view: BarView
 
+    // Preserve the user's fixed height on both displays.
+    private(set) var barHeight: CGFloat
+
     // A notched display has no usable centre, so the media capsule joins
     // the left cluster there — the same rule the shell bar applies, but
     // read from the screen itself instead of asked of a helper.
@@ -3057,8 +3107,10 @@ final class BarSurface {
     init(screen: NSScreen, monitorID: String) {
         self.screen = screen
         self.monitorID = monitorID
-        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight - stackOffset,
-                           width: screen.frame.width, height: barHeight)
+        let h: CGFloat = 34
+        self.barHeight = h
+        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - h * (barStacked ? 2 : 1),
+                           width: screen.frame.width, height: h)
         window = BarWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -3085,7 +3137,9 @@ final class BarSurface {
     }
 
     func place() {
-        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight - stackOffset,
+        // Screen changes keep the user's configured bar height.
+        barHeight = 34
+        let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight * (barStacked ? 2 : 1),
                            width: screen.frame.width, height: barHeight)
         window.setFrame(frame, display: true)
         view.frame = NSRect(origin: .zero, size: frame.size)
@@ -3287,7 +3341,9 @@ func pointerAtScreenTop() {
         if fullscreenDisplays().contains(screenID(screen)) {
             setRevealed(true)
         }
-    } else if revealed, openPopup == nil, fromTop > barHeight + 12 {
+    } else if revealed, openPopup == nil,
+              fromTop > (surfaces.first(where: { screenID($0.screen) == screenID(screen) })?.barHeight
+                           ?? barHeightFallback) + 12 {
         // a popup keeps it up: its anchor must not vanish under the pointer
         setRevealed(false)
     }

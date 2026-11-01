@@ -28,6 +28,9 @@ if args[0]=='list-monitors':
  if cfg['monitors']==2:print('2 | External')
 elif args[0]=='list-workspaces':print('1\\n2\\n11')
 elif args[0]=='list-windows':
+ if '--all' in args:
+  if cfg.get('failed_window_list'):sys.exit(1)
+  print(cfg.get('where','101|2\\n102|3'));sys.exit(0)
  ws=args[args.index('--workspace')+1]
  if ws==cfg.get('failed_probe'):sys.exit(1)
  if ws=='1' or (len(ws)==1 and cfg.get('primary_full')):print('99')
@@ -52,8 +55,8 @@ class CollapseHook(unittest.TestCase):
             p.chmod(0o755)
         self.script = self.root / "hook"
         self.script.write_text(SOURCE.read_text().replace("$HOME", "$OMACOSY_TEST_ROOT")
-                               .replace("/opt/homebrew/bin", str(self.bin))
-                               .replace("/tmp/omacosy", str(self.root / "omacosy")))
+                               .replace("/tmp/omacosy", str(self.root / "omacosy"))
+                               .replace("/opt/homebrew/bin", str(self.bin)))
         self.map = self.state / "collapse-map"
 
     def run_hook(self, op, *args, **scenario):
@@ -74,13 +77,13 @@ class CollapseHook(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(["omacosy-native-spaces", "collapse"], calls)
         self.assertIn(["aerospace", "move-node-to-workspace", "--window-id", "101", "2"], calls)
-        self.assertEqual(self.map.read_text(), "101\t11\n")
+        self.assertEqual(self.map.read_text(), "101\t11\t2\t0\n")
 
     def test_unverified_native_move_is_not_retried(self):
         result, calls = self.run_hook("collapse", monitors=1, native_exits=[1])
         self.assertEqual(result.returncode, 1)
         self.assertEqual(calls.count(["omacosy-native-spaces", "collapse"]), 1)
-        self.assertEqual(self.map.read_text(), "101\t11\n")
+        self.assertEqual(self.map.read_text(), "101\t11\t2\t0\n")
 
     def test_full_primary_set_keeps_guest_without_merging(self):
         result, calls = self.run_hook("collapse", monitors=1, primary_full=True)
@@ -103,7 +106,7 @@ class CollapseHook(unittest.TestCase):
         self.map.write_text("101\t11\n102\t12\n")
         result, calls = self.run_hook("restore", monitors=2, failed_windows=["102"])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.map.read_text(), "102\t12\n")
+        self.assertEqual(self.map.read_text(), "102\t12\t\t1\n")
         self.assertIn(["omacosy-native-spaces", "snapshot"], calls)
 
     def test_interrupted_restore_map_is_recovered(self):
@@ -119,6 +122,40 @@ class CollapseHook(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.map.read_text(), "101\t11\n")
         self.assertFalse(any(call[0] == "omacosy-native-spaces" for call in calls))
+
+
+
+    def test_restore_keeps_windows_the_user_moved(self):
+        self.map.write_text("101\t11\t2\t0\n")
+        result, calls = self.run_hook("restore", monitors=2, where="101|4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.map.read_text(), "")
+        self.assertFalse(any(call[:2] == ["aerospace", "move-node-to-workspace"] for call in calls))
+
+    def test_unavailable_window_list_keeps_recovery_map(self):
+        self.map.write_text("101\t11\t2\t0\n")
+        before = self.map.read_bytes()
+        result, calls = self.run_hook("restore", monitors=2, failed_window_list=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.map.read_bytes(), before)
+
+    def test_repeated_refusal_keeps_local_recovery_record(self):
+        self.map.write_text("101\t11\t2\t3\n")
+        result, calls = self.run_hook("restore", monitors=2, failed_windows=["101"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.map.read_text(), "101\t11\t2\t4\n")
+
+
+
+    def test_legacy_record_survives_refusal_then_success(self):
+        self.map.write_text("101\t11\n")
+        result, calls = self.run_hook("restore", monitors=2, failed_windows=["101"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.map.read_text(), "101\t11\t\t1\n")
+        result, calls = self.run_hook("restore", monitors=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.map.read_text(), "")
+        self.assertEqual(calls.count(["aerospace", "move-node-to-workspace", "--window-id", "101", "11"]), 2)
 
 
 unittest.main()

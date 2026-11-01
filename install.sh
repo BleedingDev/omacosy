@@ -288,18 +288,68 @@ read_apps() {
     case "$k" in
       TERMINAL) TERMINAL="$v" ;;
       BROWSER) BROWSER="$v" ;;
+      EMAIL) EMAIL="$v" ;;
       MUSIC) MUSIC="$v" ;;
       MESSENGER) MESSENGER="$v" ;;
     esac
   done < "$f"
 }
+# The apps the launch chords open. config/apps.conf holds the shipped
+# defaults and apps.local.conf overrides them; BROWSER and EMAIL are
+# deliberately left unset there, so those chords follow the macOS default
+# web browser and mail app (see bin/omacosy-browser, bin/omacosy-open)
+# until you name one.
+TERMINAL= BROWSER= EMAIL= MUSIC= MESSENGER=
 read_apps "$REPO_DIR/config/apps.conf"
 read_apps "$REPO_DIR/config/apps.local.conf"
 # Super+Shift+Y is bound only where yazi is installed: an optional tool gets
 # no chord that can only fail. Installing it later takes a re-run.
 if command -v yazi >/dev/null 2>&1 || [ -x /opt/homebrew/bin/yazi ]; then YAZI_LINE='s|^#yazi# ||'; else YAZI_LINE='/^#yazi# /d'; fi
+
+# Top gap. The bar is BAR_HEIGHT tall and sits at the very top of the panel,
+# so a tiled window has to start below it. A notched display already excludes
+# the camera strip from the usable area, so the bar occupies space no window
+# could take and only the margin is left to reserve; a flat panel excludes
+# nothing, so the bar's whole height is reserved too. Subtracting the inset
+# covers both, and never goes below the margin the other three edges use.
+#
+# Asked, not assumed. The bar's height comes from macOS (NSMenu.menuBarHeight)
+# and the inset from the display, because a constant goes stale on hardware
+# that does not exist yet — and "built-in" is not the same set as "notched".
+# The helper is built further down, so a first install has nothing to ask:
+# there, keep the values the config shipped with (10 built-in, 42 elsewhere).
+BAR_MARGIN=8                              # matches inner/outer gaps in the template
+OUTER_TOP=10                              # first-install fallback, as shipped
+OUTER_TOP_EXT=42                          # first-install fallback, as shipped
+BAR_HEIGHT="$("$HOME/.local/bin/omacosy-helper" bar-height 2>/dev/null || true)"
+case "$BAR_HEIGHT" in
+  ''|*[!0-9]*) ;;                         # no helper yet: keep the shipped fallback
+  *)
+    # No external display has a notch, so its gap is the inset-0 case: the
+    # bar's whole height plus the margin. The external's bar is as tall as
+    # ITS strip, which menuBarHeight cannot answer (it follows the main
+    # display, and a notched built-in's strip is taller); ask the helper
+    # for the external's own and fall back to the main one when no
+    # external is up to be asked.
+    OUTER_TOP_EXT=$(( BAR_HEIGHT + BAR_MARGIN ))
+    BAR_HEIGHT_EXT="$("$HOME/.local/bin/omacosy-helper" bar-height-external 2>/dev/null || true)"
+    case "$BAR_HEIGHT_EXT" in
+      ''|*[!0-9]*) ;;                     # no external up: the main height stands
+      *) OUTER_TOP_EXT=$(( BAR_HEIGHT_EXT + BAR_MARGIN )) ;;
+    esac
+    OUTER_TOP=$OUTER_TOP_EXT
+    INSET="$("$HOME/.local/bin/omacosy-helper" safe-top 2>/dev/null || true)"
+    case "$INSET" in
+      ''|*[!0-9]*) ;;                     # no inset: keep the flat-panel value
+      *) OUTER_TOP=$(( BAR_HEIGHT + BAR_MARGIN - INSET ))
+         if [ "$OUTER_TOP" -lt "$BAR_MARGIN" ]; then OUTER_TOP=$BAR_MARGIN; fi ;;
+    esac
+    ;;
+esac
+
 sed -e "s|@TERMINAL@|$TERMINAL|g" -e "s|@BROWSER@|$BROWSER|g" \
     -e "s|@MUSIC@|$MUSIC|g" -e "s|@MESSENGER@|$MESSENGER|g" -e "$YAZI_LINE" \
+    -e "s|@OUTER_TOP@|$OUTER_TOP|g" -e "s|@OUTER_TOP_EXT@|$OUTER_TOP_EXT|g" \
   "$REPO_DIR/config/aerospace/aerospace.template.toml" > "$REPO_DIR/config/aerospace/aerospace.toml"
 
 log "Linking configs"
@@ -322,8 +372,85 @@ if [ -f "$HOME/.config/karabiner/karabiner.json" ] \
   cp "$HOME/.config/karabiner/karabiner.json" "$HOME/.config/karabiner/karabiner.json.bak.omacosy"
   mark "had-karabiner-config"
 fi
+# The seed replaces the file, but the per-device switches are the user's:
+# a keyboard that is also a pointing device (Hall-effect and Bluetooth
+# boards often are) is left unmodified until "Modify events" is turned on
+# for it, and that switch is a `devices` entry naming its vendor and
+# product — no generic entry matches it. Carry those entries over.
+KB_DEVICES=""
+if [ -f "$HOME/.config/karabiner/karabiner.json" ]; then
+  KB_DEVICES="$(python3 - "$HOME/.config/karabiner/karabiner.json" <<'PY' 2>/dev/null || true
+import json, sys
+c = json.load(open(sys.argv[1]))
+p = next((p for p in c.get("profiles", []) if p.get("selected")), None)
+print(json.dumps(p.get("devices", []) if p else []))
+PY
+)"
+fi
 cp "$REPO_DIR/config/karabiner/karabiner.json" "$HOME/.config/karabiner/karabiner.json"
+if [ -n "$KB_DEVICES" ] && [ "$KB_DEVICES" != "[]" ]; then
+  python3 - "$HOME/.config/karabiner/karabiner.json" "$KB_DEVICES" <<'PY' \
+    || log "WARNING: could not carry your Karabiner device settings over"
+import json, sys
+f, kept = sys.argv[1], json.loads(sys.argv[2])
+c = json.load(open(f))
+p = next(p for p in c["profiles"] if p.get("selected"))
+devs = p.setdefault("devices", [])
+seen = [d.get("identifiers") for d in devs]
+devs += [d for d in kept if d.get("identifiers") not in seen]  # the seed's own entries win
+json.dump(c, open(f, "w"), indent=4)
+PY
+fi
+# Name any connected keyboard Karabiner will leave alone, so a new board
+# whose Caps Lock does nothing is a one-switch fix rather than a mystery.
+# Not switched on here: mice that also present a keyboard (Logitech's,
+# for one) match the same test, and routing them through Karabiner is
+# the user's call.
+KB_CLI="/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
+# Best-effort. On a first install the Karabiner daemon is not up yet, so
+# the CLI exits 0 with an empty stdout and python's json.loads fails.
+# Under pipefail that aborts the install before AeroSpace, the helpers,
+# or the Caps Lock remap ever start. A missing note is fine; a
+# half-installed desktop is not. || true also covers a non-zero CLI.
+if [ -x "$KB_CLI" ]; then
+  "$KB_CLI" --list-connected-devices 2>/dev/null | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(0)
+devs = json.loads(raw)
+cfg = json.load(open(sys.argv[1]))
+p = next(p for p in cfg["profiles"] if p.get("selected"))
+on = [d.get("identifiers", {}) for d in p.get("devices", []) if d.get("ignore") is False]
+for d in devs:
+    i = d.get("device_identifiers", {})
+    if not (i.get("is_keyboard") and i.get("is_pointing_device")) or i.get("is_built_in_keyboard"):
+        continue
+    if any(o.get("vendor_id") == i.get("vendor_id") and o.get("product_id") == i.get("product_id") for o in on):
+        continue
+    print(d.get("product") or "an unnamed device")
+' "$HOME/.config/karabiner/karabiner.json" 2>/dev/null | while IFS= read -r name; do
+    log "NOTE: Karabiner leaves \"$name\" unmodified (it is also a pointing device), so"
+    log "  Caps Lock is no Super key there. If it is a keyboard: Karabiner-Elements >"
+    log "  Settings > Devices > turn on Modify events for it. Re-runs keep that switch."
+  done || true
+fi
 launchctl kickstart -k "gui/$(id -u)/org.pqrs.service.agent.Karabiner-Console-User-Server" 2>/dev/null || true
+# the copy above reset the file to the seed, which has only the Caps Lock
+# rule: every chord that RUNS something (terminal, launcher, theme, lock)
+# lives in the injected OmniWM layer. Re-add it right here, so a later
+# failure — a build, or the update killed mid-run — cannot leave the
+# keyboard without its exec chords. The OmniWM handover near the end runs
+# this again, which also keeps the rules in step with a changed apps.conf.
+#
+# Not while AeroSpace is still running: these rules must never be active
+# under AeroSpace, whose own bindings grab the same chords (both would
+# fire). When AeroSpace is up, the handover below stops it and injects the
+# layer itself.
+if [ "$WM" = omniwm ] && ! pgrep -x AeroSpace >/dev/null; then
+  "$REPO_DIR/bin/omacosy-karabiner-omniwm" install >/dev/null 2>&1 \
+    || log "WARNING: could not restore the OmniWM chords; run: omacosy-karabiner-omniwm install"
+fi
 # Karabiner's Menu and NotificationWindow helpers are disabled the
 # SUPPORTED way in karabiner.json (global.show_in_menu_bar and
 # global.enable_notification_window, both false) — the bootout below
@@ -405,11 +532,11 @@ if [ ! -x "$HOME/.local/bin/omacosy-ffm" ] || [ "$REPO_DIR/helper/ffm.swift" -nt
   log "Building omacosy-ffm (grant Accessibility when prompted)"
   swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-ffm" "$REPO_DIR/helper/ffm.swift" "$REPO_DIR/helper/window-lifecycle.swift" "$REPO_DIR/helper/window-diagnostics.swift"
 fi
-
-# focused-window border ring (replaces JankyBorders; no permissions;
-# SkyLight for the window-server event notifications)
+# focused-window border ring (replaces JankyBorders; SkyLight for the
+# window-server event notifications; the optional Accessibility grant only
+# lets it hear a close at once — see the README permissions table)
 if [ ! -x "$HOME/.local/bin/omacosy-borders" ] || [ "$REPO_DIR/helper/borders.swift" -nt "$HOME/.local/bin/omacosy-borders" ]; then
-  log "Building omacosy-borders"
+  log "Building omacosy-borders (grant Accessibility when prompted)"
   swiftc -O -F /System/Library/PrivateFrameworks -framework SkyLight -o "$HOME/.local/bin/omacosy-borders" "$REPO_DIR/helper/borders.swift"
 fi
 # One signing policy for CLI helpers and the bar; local identities must cover
@@ -423,6 +550,10 @@ done
 # would be overwritten and every rebuild would invalidate the
 # Accessibility grant again)
 
+# (the optional Accessibility grant is asked by omacosy-borders itself, once,
+# at daemon startup — see helper/borders.swift. Calling it from here put the
+# prompt on the terminal, so the grant landed on the terminal's entry.)
+
 # hover-ignore list (launchd agents can't read ~/Documents — copied)
 mkdir -p "$HOME/.config/omacosy"
 cp "$REPO_DIR/config/ffm-ignore" "$HOME/.config/omacosy/ffm-ignore"
@@ -430,8 +561,8 @@ cp "$REPO_DIR/config/borders.conf" "$HOME/.config/omacosy/borders.conf"
 # app choices, RESOLVED (apps.local.conf already applied), for the same
 # reason: the bar's activity pill launches $TERMINAL and cannot read the
 # repo from a launchd agent when the clone is TCC-protected
-printf 'TERMINAL="%s"\nBROWSER="%s"\nMUSIC="%s"\nMESSENGER="%s"\n' \
-  "$TERMINAL" "$BROWSER" "$MUSIC" "$MESSENGER" > "$HOME/.config/omacosy/apps.conf"
+printf 'TERMINAL="%s"\nBROWSER="%s"\nEMAIL="%s"\nMUSIC="%s"\nMESSENGER="%s"\n' \
+  "$TERMINAL" "$BROWSER" "$EMAIL" "$MUSIC" "$MESSENGER" > "$HOME/.config/omacosy/apps.conf"
 
 cat > "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -500,12 +631,15 @@ if [ "$(readlink "$HOME/.local/bin/omacosy-focus-guard" 2>/dev/null || true)" = 
 fi
 link "$REPO_DIR/bin/omacosy-ws-collapse" "$HOME/.local/bin/omacosy-ws-collapse"
 link "$REPO_DIR/bin/omacosy-update" "$HOME/.local/bin/omacosy-update"
+link "$REPO_DIR/bin/omacosy-weather" "$HOME/.local/bin/omacosy-weather"
 link "$REPO_DIR/bin/omacosy-spawn" "$HOME/.local/bin/omacosy-spawn"
 link "$REPO_DIR/bin/omacosy-wm-switch" "$HOME/.local/bin/omacosy-wm-switch"
 link "$REPO_DIR/bin/omacosy-karabiner-omniwm" "$HOME/.local/bin/omacosy-karabiner-omniwm"
 link "$REPO_DIR/bin/omacosy-layout" "$HOME/.local/bin/omacosy-layout"
 link "$REPO_DIR/bin/omacosy-float" "$HOME/.local/bin/omacosy-float"
 link "$REPO_DIR/bin/omacosy-finder-window" "$HOME/.local/bin/omacosy-finder-window"
+link "$REPO_DIR/bin/omacosy-browser" "$HOME/.local/bin/omacosy-browser"
+link "$REPO_DIR/bin/omacosy-open" "$HOME/.local/bin/omacosy-open"
 link "$REPO_DIR/bin/omacosy-cycle" "$HOME/.local/bin/omacosy-cycle"
 
 # --- 3. omarchy theme convention -------------------------------------------
@@ -570,12 +704,10 @@ fi
 if grep -qxF "cloned-aerospace-swipe" "$MANIFEST" 2>/dev/null && [ -d "$HOME/.local/share/aerospace-swipe" ]; then
   rm -rf "$HOME/.local/share/aerospace-swipe" "$HOME/.config/aerospace-swipe"
 fi
-# Rebuilding this daemon COSTS ITS ACCESSIBILITY GRANT: measured on
-# macOS 26.3, TCC pins the grant to the exact build (any re-sign is a
-# new subject — a stable Apple Development identity does not carry it),
-# so every rebuild means dead swipes until the user re-grants. The only
-# safe rebuild is the one that does not happen: skip the whole block
-# unless the binary is missing or a source file actually changed.
+# Rebuilding this daemon cost its Accessibility grant on macOS 26.3, with
+# or without an identity. On macOS 27.2 a build signed with an Apple
+# Development identity kept it (measured twice). The block still runs
+# only when the binary is missing or a source file changed.
 # omacosy-omni: the scripts' held-socket client for OmniWM (plain C,
 # ~3 ms launch; no grants involved, so it is simply rebuilt when stale)
 G="$REPO_DIR/helper/gesture"
@@ -600,15 +732,10 @@ if [ -n "$GESTURE_STALE" ]; then
     || echo "omacosy-gesture build failed"
   cp "$G/gesture-info.plist" "$GESTURE_APP/Contents/Info.plist"
   echo "APPL????" > "$GESTURE_APP/Contents/PkgInfo"
-  # sign BEFORE anything launches: the only binary launchd ever starts
-  # is the one the user grants
-  if security find-identity -p codesigning -v 2>/dev/null | grep -q "Apple Development"; then
-    codesign -f -s "Apple Development" --identifier com.omacosy.gesture \
-      --entitlements "$G/accessibility.entitlements" "$GESTURE_APP" 2>/dev/null || true
-  else
-    codesign -f --entitlements "$G/accessibility.entitlements" --sign - "$GESTURE_APP" 2>/dev/null || true
-  fi
 fi
+# sign BEFORE anything launches: the only binary launchd ever starts is the
+# one the user grants. With an identity, at every run, like the others.
+"$REPO_DIR/bin/omacosy-sign" "$GESTURE_APP" com.omacosy.gesture
 cat > "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -628,12 +755,13 @@ launchctl load "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/nul
 # a rebuild strands the daemon in its permission-wait loop with no
 # visible symptom but dead swipes — check and say so out loud
 sleep 2
+# (when the list below names omacosy-gesture, that list says what to do)
 if tail -5 /tmp/omacosy-gesture.log 2>/dev/null | grep -q "Waiting for accessibility"; then
-  log "WARNING: omacosy-gesture is waiting for its Accessibility grant"
-  log "  (a rebuild makes macOS treat it as a new app — this is a macOS rule, not a bug)."
-  log "  Fix: System Settings -> Privacy & Security -> Accessibility -> toggle omacosy-gesture"
+  log "WARNING: omacosy-gesture is waiting for its Accessibility grant."
+  log "  Switching its entry off and on does not help: quit System Settings,"
+  log "  reopen Privacy & Security -> Accessibility, remove omacosy-gesture"
+  log "  with the - button, then add it again with +."
 fi
-
 # --- 6. macOS look ----------------------------------------------------------
 "$REPO_DIR/macos-defaults.sh"
 
