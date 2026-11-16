@@ -22,7 +22,7 @@
 +
 +    @MainActor func synchronizeNativeTabGroups(_ cm: CancellationMode) async throws {
 +        guard rawAppBundleId == "com.mitchellh.ghostty" else { return }
-+        let observations = try await thread?.runInLoop(cm) { [axApp, windows] job in
++        let observations: [NativeTabObservation] = try await thread?.runInLoop(cm) { [axApp, windows] job in
 +            try job.checkCancellation()
 +            return observeNativeTabGroups(
 +                windows: windows.threadGuarded,
@@ -261,3 +261,50 @@
 +        XCTAssertEqual(state.move(windowId: 20, to: "4"), [11, 20])
 +    }
 +}
+--- a/Sources/AppBundle/command/impl/MoveCommand.swift
++++ b/Sources/AppBundle/command/impl/MoveCommand.swift
+@@ -33,7 +33,7 @@
+                             return .succ
+                     }
+                 } else {
+-                    return moveOut(tilingWindow: currentWindow, direction: direction, io, args, env)
++                    return await moveOut(tilingWindow: currentWindow, direction: direction, io, args, env)
+                 }
+             case .floatingWindowsContainer: // floating window
+                 return .fail(io.err("moving floating windows isn't yet supported")) // todo
+@@ -52,7 +52,7 @@
+     _ args: MoveCmdArgs,
+     _ direction: CardinalDirection,
+     _ env: CmdEnv,
+-) -> BinaryExitCode {
++) async -> BinaryExitCode {
+     switch args.boundaries {
+         case .workspace:
+             switch args.boundariesAction {
+@@ -72,7 +72,7 @@
+                     .copy(\.windowId, window.windowId)
+                     .copy(\.focusFollowsWindow, focus.windowOrNil == window)
+ 
+-                return MoveNodeToMonitorCommand(args: moveNodeToMonitorArgs).run(env, io)
++                return await MoveNodeToMonitorCommand(args: moveNodeToMonitorArgs).run(env, io)
+             } else {
+                 return hitAllMonitorsOuterFrameBoundaries(window, workspace, args, direction)
+             }
+@@ -102,7 +102,7 @@
+     _ io: CmdIo,
+     _ args: MoveCmdArgs,
+     _ env: CmdEnv,
+-) -> BinaryExitCode {
++) async -> BinaryExitCode {
+     let innerMostTilingContainer = window.parents.first(where: {
+         return switch $0.parent?.cases {
+             case .tilingContainer(let parent): parent.orientation == direction.orientation
+@@ -125,7 +125,7 @@
+             window.bind(to: parent, adaptiveWeight: WEIGHT_AUTO, index: ownIndex + direction.insertionOffset)
+             return .succ
+         case .workspace(let parent):
+-            return hitWorkspaceBoundaries(window, parent, io, args, direction, env)
++            return await hitWorkspaceBoundaries(window, parent, io, args, direction, env)
+     }
+ }
+ 
