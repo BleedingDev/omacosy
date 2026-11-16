@@ -1,0 +1,48 @@
+name: AeroSpace release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - patches/aerospace/**
+      - bin/omacosy-aerospace-release
+      - helper/test_aerospace_release.py
+      - .github/workflows/aerospace-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aerospace-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release tooling
+        run: python3 -m unittest discover -s helper -p test_aerospace_release.py
+      - name: Install generator shell
+        run: brew install bash
+      - name: Download pinned application resources
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/nikitabobko/AeroSpace/releases/download/v0.21.3-Beta/AeroSpace-v0.21.3-Beta.zip \
+            --output "$RUNNER_TEMP/base.zip"
+          ditto -x -k "$RUNNER_TEMP/base.zip" "$RUNNER_TEMP/base"
+      - name: Test and build patched app and CLI
+        run: |
+          bin/omacosy-aerospace-release build --unsigned --jobs 3 \
+            --base-app "$RUNNER_TEMP/base/AeroSpace-v0.21.3-Beta/AeroSpace.app" \
+            --output "$RUNNER_TEMP/aerospace-release"
+      - name: Package release
+        run: ditto -c -k --keepParent "$RUNNER_TEMP/aerospace-release" "$RUNNER_TEMP/aerospace-release.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aerospace-release-arm64
+          path: ${{ runner.temp }}/aerospace-release.zip
+          if-no-files-found: error
+          retention-days: 7

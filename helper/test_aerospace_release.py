@@ -18,6 +18,23 @@ loader.exec_module(release)
 
 
 class ReleaseSafetyTests(unittest.TestCase):
+    def test_sign_refuses_corrupted_ci_artifact_before_using_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "app-binary"
+            binary.write_text("original")
+            cli = root / "aerospace"
+            cli.write_text("CLI")
+            metadata = {"app_sha256": release.digest(binary),
+                        "cli_sha256": release.digest(cli), "version": "version"}
+            (root / "release.json").write_text(json.dumps(metadata))
+            binary.write_text("changed")
+            with patch.object(release, "executable", return_value=binary), \
+                 patch.object(release, "signing_identity") as identity:
+                with self.assertRaisesRegex(ValueError, "Application does not match"):
+                    release.sign_release(types.SimpleNamespace(release=root, identity=None))
+                identity.assert_not_called()
+
     def test_missing_key_has_no_signing_fallback(self):
         with patch.object(release, "run", return_value=types.SimpleNamespace(stdout="")) as command:
             with self.assertRaisesRegex(ValueError, "unavailable"):

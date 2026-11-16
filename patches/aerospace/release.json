@@ -2,6 +2,9 @@
   "source_commit": "d56e1637c3a1ed660d0cadd7534e94fb3218d1c3",
   "source_sha256": "d51d9c59564e47e7c06300d410680e7eac6f0e6bf5294c9a11e9b3615b1acaa8",
   "base_version": "0.21.3-Beta",
-  "build_version": "0.21.3-Beta-omacosy-focus-owner-r3",
-  "patch_sha256": "239c9fe08197514b95127298b39ce114e5be3fbac52a79959f9dc4ca37756ec2"
+  "build_version": "0.21.3-Beta-omacosy-desktop-r4",
+  "patches": {
+    "focus-stability.patch": "239c9fe08197514b95127298b39ce114e5be3fbac52a79959f9dc4ca37756ec2",
+    "socket-recovery.patch": "b60a6ceeb5062ed3832b38626203b378642e2f5a0969b2218fd1ffe3bc516e32"
+  }
 }

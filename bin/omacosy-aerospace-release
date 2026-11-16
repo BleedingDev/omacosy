@@ -63,23 +63,42 @@ def verify_release(directory):
     metadata = json.loads((directory / "release.json").read_text())
     app = directory / "AeroSpace.app"
     verify_signature(app, metadata["signing_identity"])
+    verify_contents(directory, metadata)
+    return metadata
+
+
+def verify_contents(directory, metadata):
+    app = directory / "AeroSpace.app"
     if digest(executable(app)) != metadata["app_sha256"]:
         raise ValueError("Application does not match the release manifest")
     if digest(directory / "aerospace") != metadata["cli_sha256"]:
         raise ValueError("CLI does not match the release manifest")
     if app_version(app) != metadata["version"]:
         raise ValueError("Application version does not match the release manifest")
-    return metadata
+
+
+def sign_release(args):
+    metadata = json.loads((args.release / "release.json").read_text())
+    verify_contents(args.release, metadata)
+    identity = signing_identity(args.identity)
+    app = args.release / "AeroSpace.app"
+    run(["codesign", "--force", "--deep", "--sign", identity, "--timestamp=none", app])
+    verify_signature(app, identity)
+    metadata.update(signing_identity=identity, app_sha256=digest(executable(app)))
+    (args.release / "release.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    verify_release(args.release)
+    print("Signed and verified:", args.release)
 
 
 def build(args):
     if args.output.exists():
         raise ValueError("Output already exists; choose a new release directory")
-    identity = signing_identity(args.identity)
+    identity = None if args.unsigned else signing_identity(args.identity)
     spec = json.loads((PATCH_DIR / "release.json").read_text())
-    patch = PATCH_DIR / "focus-stability.patch"
-    if digest(patch) != spec["patch_sha256"]:
-        raise ValueError("Patch checksum differs from release specification")
+    patches = [PATCH_DIR / name for name in spec["patches"]]
+    for patch in patches:
+        if digest(patch) != spec["patches"][patch.name]:
+            raise ValueError("Patch checksum differs from release specification: " + patch.name)
     with (args.base_app / "Contents/Info.plist").open("rb") as stream:
         info = plistlib.load(stream)
     if info.get("CFBundleIdentifier") != APP_ID or info.get("CFBundleShortVersionString") != spec["base_version"]:
@@ -111,7 +130,8 @@ def build(args):
             source = root / ("AeroSpace-" + spec["source_commit"])
             # Upstream tests locate fixtures using this marker; not a Git init.
             (source / ".git").touch()
-            run(["patch", "-p1", "-F", "0", "-i", patch], cwd=source)
+            for patch in patches:
+                run(["patch", "-p1", "-F", "0", "-i", patch], cwd=source)
             bash = next((p for p in (Path("/opt/homebrew/bin/bash"), Path("/usr/local/bin/bash"))
                          if p.is_file()), Path(shutil.which("bash") or "/bin/bash"))
             if int(run([bash, "-c", 'echo "$BASH_VERSION"']).stdout.strip().split(".")[0]) < 4:
@@ -138,10 +158,17 @@ def build(args):
             shutil.copytree(args.base_app, app, symlinks=True)
             shutil.copy2(build_dir / "scratch/release/AeroSpaceApp", executable(app))
             shutil.copy2(build_dir / "scratch/release/aerospace", stage / "aerospace")
-            run(["codesign", "--force", "--deep", "--sign", identity, "--timestamp=none", app])
-            verify_signature(app, identity)
-            metadata = dict(spec, signing_identity=identity, version=app_version(app),
+            if identity:
+                run(["codesign", "--force", "--deep", "--sign", identity, "--timestamp=none", app])
+                verify_signature(app, identity)
+            else:
+                # ARM executables require a code signature even in CI. This is
+                # explicit ad-hoc packaging, never a substitute for the local key.
+                run(["codesign", "--force", "--deep", "--sign", "-", "--timestamp=none", app])
+            metadata = dict(spec, version=app_version(app),
                             app_sha256=digest(executable(app)), cli_sha256=digest(stage / "aerospace"))
+            if identity:
+                metadata["signing_identity"] = identity
             (stage / "release.json").write_text(json.dumps(metadata, indent=2) + "\n")
             for label, content in logs.items():
                 (stage / (label + ".log")).write_text(content)
@@ -149,7 +176,7 @@ def build(args):
                 if (source / name).is_file():
                     shutil.copy2(source / name, stage / "UPSTREAM-LICENSE")
                     break
-            verify_release(stage)
+            verify_contents(stage, metadata)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             try:
                 shutil.copytree(stage, args.output)
@@ -214,10 +241,15 @@ def main():
     build_parser.add_argument("--output", type=Path, required=True)
     build_parser.add_argument("--base-app", type=Path, default=Path("/Applications/AeroSpace.app"))
     build_parser.add_argument("--identity")
+    build_parser.add_argument("--unsigned", action="store_true",
+                              help="Build in CI without sending a signing key; sign locally before installation")
     build_parser.add_argument("--archive", type=Path)
     build_parser.add_argument("--jobs", type=int, default=4)
     verify_parser = commands.add_parser("verify")
     verify_parser.add_argument("release", type=Path)
+    sign_parser = commands.add_parser("sign")
+    sign_parser.add_argument("release", type=Path)
+    sign_parser.add_argument("--identity")
     protect_parser = commands.add_parser("protect")
     protect_parser.add_argument("--app", type=Path, default=Path("/Applications/AeroSpace.app"))
     protect_parser.add_argument("--identity")
@@ -232,6 +264,8 @@ def main():
         build(args)
     elif args.command == "verify":
         print(json.dumps(verify_release(args.release), indent=2))
+    elif args.command == "sign":
+        sign_release(args)
     elif args.command == "protect":
         protect(args)
     else:
