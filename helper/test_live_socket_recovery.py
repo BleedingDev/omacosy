@@ -45,7 +45,8 @@ def command(connection, *args):
 
 
 def membership(connection):
-    return command(connection, "list-windows", "--all", "--format", "%{window-id}|%{workspace}")
+    rows = command(connection, "list-windows", "--all", "--format", "%{window-id}|%{workspace}")
+    return dict(row.split("|", 1) for row in rows.splitlines() if row)
 
 
 def main():
@@ -72,7 +73,8 @@ def main():
                         raise TimeoutError("AeroSpace did not restore its socket")
                     time.sleep(0.05)
             with fresh:
-                assert membership(fresh) == before, "Workspace membership changed"
+                after = membership(fresh)
+                assert after == before, f"Workspace membership changed: {before} -> {after}"
                 assert command(fresh, "list-workspaces", "--focused") == focused, "Focused workspace changed"
             assert membership(held) == before, "Existing connection or desktop state was lost"
             assert subprocess.check_output(["pgrep", "-x", "AeroSpace"], text=True).strip() == server_pid, "Server restarted"
