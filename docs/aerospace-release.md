@@ -26,15 +26,15 @@ observation or a retry loop. Keep this limitation explicit when adopting the pat
 
 ## Build and inspect
 
-Requirements: macOS, Python 3.12+, Swift 6.2+, Bash 4+, and the upstream
+Requirements: macOS, Python 3.12+, Swift 6.2+, Bash 5+, and the upstream
 AeroSpace 0.21.3-Beta application bundle. Builds require network access for Swift
-dependencies. Source commit, archive checksum, and patch checksum are pinned in
+dependencies. Source commit, archive checksum, and ordered patch checksums are pinned in
 patches/aerospace/release.json. Update those together after reviewing upstream changes.
 
 Save the fingerprint of your **existing** code-signing identity in
 ~/.config/omacosy/signing-identity, or pass --identity with its 40-character SHA-1.
 List available identities with security find-identity -v -p codesigning.
-The build refuses a missing identity and never generates a certificate or falls
+The default build refuses a missing identity and never generates a certificate or falls
 back to ad-hoc signing. Keep the certificate and private key in your Keychain;
 do not commit or upload the private key.
 
@@ -50,6 +50,19 @@ upstream license, and test/build logs. The build does not install anything or
 start a window manager. Source and build directories are cleaned on exit.
 If disk-guardian-artifacts is available, build output ownership is also registered
 and released. The requested release directory is the retained deliverable.
+
+To build in CI without uploading your private key, use `build --unsigned`.
+The AeroSpace release workflow runs the Swift tests and builds the app and CLI on an arm64 macOS runner.
+The artifact uses an ad-hoc signature required to execute arm64 binaries. It cannot pass `verify` or `install-cli` until you sign it locally.
+
+After downloading and extracting `aerospace-release.zip`, sign and verify the release with your existing identity:
+
+~~~sh
+bin/omacosy-aerospace-release sign /path/to/aerospace-release
+bin/omacosy-aerospace-release verify /path/to/aerospace-release
+~~~
+
+The `sign` command checks the app and CLI hashes before using your key. It updates the release manifest after signing.
 
 ## Activate deliberately
 

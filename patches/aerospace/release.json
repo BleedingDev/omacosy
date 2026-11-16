@@ -5,6 +5,7 @@
   "build_version": "0.21.3-Beta-omacosy-desktop-r4",
   "patches": {
     "focus-stability.patch": "239c9fe08197514b95127298b39ce114e5be3fbac52a79959f9dc4ca37756ec2",
-    "socket-recovery.patch": "b60a6ceeb5062ed3832b38626203b378642e2f5a0969b2218fd1ffe3bc516e32"
+    "socket-recovery.patch": "b60a6ceeb5062ed3832b38626203b378642e2f5a0969b2218fd1ffe3bc516e32",
+    "native-tab-groups.patch": "a55c1e99252843f68766cc5e06005bbda8e9a0efbd9f0eaa77d239816e870a57"
   }
 }

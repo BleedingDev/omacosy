@@ -80,6 +80,9 @@ def verify_contents(directory, metadata):
 def sign_release(args):
     metadata = json.loads((args.release / "release.json").read_text())
     verify_contents(args.release, metadata)
+    spec = json.loads((PATCH_DIR / "release.json").read_text())
+    if any(metadata.get(key) != value for key, value in spec.items()):
+        raise ValueError("CI artifact does not match the checked-out release specification")
     identity = signing_identity(args.identity)
     app = args.release / "AeroSpace.app"
     run(["codesign", "--force", "--deep", "--sign", identity, "--timestamp=none", app])
@@ -134,8 +137,8 @@ def build(args):
                 run(["patch", "-p1", "-F", "0", "-i", patch], cwd=source)
             bash = next((p for p in (Path("/opt/homebrew/bin/bash"), Path("/usr/local/bin/bash"))
                          if p.is_file()), Path(shutil.which("bash") or "/bin/bash"))
-            if int(run([bash, "-c", 'echo "$BASH_VERSION"']).stdout.strip().split(".")[0]) < 4:
-                raise ValueError("Upstream generation requires Bash 4 or newer")
+            if int(run([bash, "-c", 'echo "$BASH_VERSION"']).stdout.strip().split(".")[0]) < 5:
+                raise ValueError("Upstream generation requires Bash 5 or newer")
             run([bash, "./generate.sh", "--ignore-xcodeproj", "--build-version",
                  spec["build_version"]], cwd=source)
             environment = os.environ.copy()
@@ -240,9 +243,10 @@ def main():
     build_parser = commands.add_parser("build")
     build_parser.add_argument("--output", type=Path, required=True)
     build_parser.add_argument("--base-app", type=Path, default=Path("/Applications/AeroSpace.app"))
-    build_parser.add_argument("--identity")
-    build_parser.add_argument("--unsigned", action="store_true",
-                              help="Build in CI without sending a signing key; sign locally before installation")
+    signing = build_parser.add_mutually_exclusive_group()
+    signing.add_argument("--identity")
+    signing.add_argument("--unsigned", action="store_true",
+                         help="Build in CI without sending a signing key; sign locally before installation")
     build_parser.add_argument("--archive", type=Path)
     build_parser.add_argument("--jobs", type=int, default=4)
     verify_parser = commands.add_parser("verify")

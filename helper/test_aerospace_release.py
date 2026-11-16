@@ -18,6 +18,16 @@ loader.exec_module(release)
 
 
 class ReleaseSafetyTests(unittest.TestCase):
+    def test_sign_refuses_artifact_from_another_release_before_using_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "release.json").write_text(json.dumps({"build_version": "old"}))
+            with patch.object(release, "verify_contents"), \
+                 patch.object(release, "signing_identity") as identity:
+                with self.assertRaisesRegex(ValueError, "checked-out release"):
+                    release.sign_release(types.SimpleNamespace(release=root, identity=None))
+                identity.assert_not_called()
+
     def test_sign_refuses_corrupted_ci_artifact_before_using_key(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
