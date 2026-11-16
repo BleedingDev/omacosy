@@ -6,6 +6,6 @@
   "patches": {
     "focus-stability.patch": "239c9fe08197514b95127298b39ce114e5be3fbac52a79959f9dc4ca37756ec2",
     "socket-recovery.patch": "b60a6ceeb5062ed3832b38626203b378642e2f5a0969b2218fd1ffe3bc516e32",
-    "native-tab-groups.patch": "f14df80750e241663471e1ffecd116e434c09ba248fa174b35e656d0f3a87321"
+    "native-tab-groups.patch": "80cb18b5dbf4448534aa824039c471c7975c93e7d51caae1accf8fdc80aa0e8c"
   }
 }

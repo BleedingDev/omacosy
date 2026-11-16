@@ -8,7 +8,7 @@
      private var windowsCount = 0
      var lastNativeFocusedWindowId: UInt32? = nil
      private var thread: Thread?
-@@ -125,10 +126,37 @@
+@@ -125,10 +126,33 @@
                  .windowId
          }
          guard let windowId else { return nil }
@@ -20,42 +20,30 @@
  
      @MainActor static func cancelNativeFocus() { focusJob?.cancel() }
 +
-+    @MainActor func synchronizeNativeTabGroups(_ cm: CancellationMode) async throws {
-+        guard rawAppBundleId == "com.mitchellh.ghostty" else { return }
-+        let observations: [NativeTabObservation] = try await thread?.runInLoop(cm) { [axApp, windows] job in
++    @MainActor @discardableResult
++    func synchronizeNativeTabGroups(_ cm: CancellationMode) async throws -> Bool {
++        guard rawAppBundleId == "com.mitchellh.ghostty" else { return true }
++        let snapshot: NativeTabSnapshot = try await thread?.runInLoop(cm) { [axApp, windows] job in
 +            try job.checkCancellation()
-+            return observeNativeTabGroups(
-+                windows: windows.threadGuarded,
-+                selected: axApp.threadGuarded.get(Ax.windowsAttr) ?? [],
-+            )
-+        } ?? []
-+        for observation in observations {
-+            guard let window = MacWindow.allWindowsMap[observation.windowId],
-+                  let workspace = window.nodeWorkspace else { continue }
-+            if let destination = nativeTabWorkspaces.observe(
-+                windowId: observation.windowId,
-+                group: observation.group,
-+                workspace: workspace.name,
-+            ), destination != workspace.name {
-+                let target = Workspace.get(byName: destination)
-+                let container: NonLeafTreeNodeObject = window.isFloating
-+                    ? target.floatingWindowsContainer : target.rootTilingContainer
-+                window.bind(to: container, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
-+            }
++            guard let selected = axApp.threadGuarded.get(Ax.windowsAttr) else { return .unavailable }
++            return observeNativeTabGroups(windows: windows.threadGuarded, selected: selected)
++        } ?? .unavailable
++        let workspaces = MacWindow.allWindowsMap.compactMapValues { $0.nodeWorkspace?.name }
++        guard let destinations = nativeTabWorkspaces.synchronize(snapshot, workspaces: workspaces) else { return false }
++        for (id, destination) in destinations {
++            guard let window = MacWindow.allWindowsMap[id],
++                  window.nodeWorkspace?.name != destination else { continue }
++            let target = Workspace.get(byName: destination)
++            let container: NonLeafTreeNodeObject = window.isFloating
++                ? target.floatingWindowsContainer : target.rootTilingContainer
++            window.bind(to: container, adaptiveWeight: WEIGHT_AUTO, index: INDEX_BIND_LAST)
 +        }
++        return true
 +    }
  
      @MainActor func nativeFocus(_ windowId: UInt32, raise: Bool = true) {
          if serverArgs.isReadOnly { return }
-@@ -335,6 +363,7 @@
-             return (Array(alive.keys), Array(dead.keys))
-         }
-         windowsCount = alive.count
-+        try await synchronizeNativeTabGroups(.cancellable)
-         for windowId in dead {
-             setFrameJobs.removeValue(forKey: windowId)?.cancel()
-         }
-@@ -373,6 +402,7 @@
+@@ -373,6 +397,7 @@
  private final class AxWindow {
      let windowId: UInt32
      let ax: AXUIElement
@@ -63,7 +51,7 @@
      // periphery:ignore
      private let axSubscriptions: [AxSubscription] // keep subscriptions in memory
  
-@@ -445,3 +475,27 @@
+@@ -445,3 +470,35 @@
      try job.checkCancellation()
      return try body()
  }
@@ -71,29 +59,37 @@
 +// AppKit moves the same AXTabGroup element between the selected NSWindows.
 +// Inactive tabs lose AXChildren, so only AXWindows-enumerated live windows may
 +// clear membership. Detached and independently created windows have no group.
-+private func observeNativeTabGroups(windows: [UInt32: AxWindow], selected: [WindowIdAndAxUiElement]) -> [NativeTabObservation] {
++private func observeNativeTabGroups(windows: [UInt32: AxWindow], selected: [WindowIdAndAxUiElement]) -> NativeTabSnapshot {
 +    var identities = windows.values.compactMap { $0.nativeTabGroup }
 +    var result: [NativeTabObservation] = []
++    var updates: [(AxWindow, (AXUIElement, UUID)?)] = []
 +    for (id, ax) in selected.sorted(by: { $0.0 < $1.0 }) {
 +        guard let window = windows[id] else { continue }
 +        var value: CFTypeRef?
 +        guard unsafe AXUIElementCopyAttributeValue(ax, kAXChildrenAttribute as CFString, &value) == .success,
-+              let children = value as? [AXUIElement] else { continue }
-+        guard let element = children.first(where: { $0.get(Ax.roleAttr) == "AXTabGroup" }) else {
-+            window.nativeTabGroup = nil
++              let children = value as? [AXUIElement] else { return .unavailable }
++        var element: AXUIElement?
++        for child in children {
++            guard let role = child.get(Ax.roleAttr) else { return .unavailable }
++            if role == "AXTabGroup" { element = child; break }
++        }
++        guard let element else {
++            updates.append((window, nil))
 +            result.append(NativeTabObservation(windowId: id, group: nil))
 +            continue
 +        }
 +        let group = identities.first(where: { CFEqual($0.0, element) })?.1 ?? UUID()
-+        window.nativeTabGroup = (element, group)
++        updates.append((window, (element, group)))
 +        identities.append((element, group))
 +        result.append(NativeTabObservation(windowId: id, group: group))
 +    }
-+    return result
++    // Commit native identities only after the complete external read succeeds.
++    for (window, group) in updates { window.nativeTabGroup = group }
++    return .available(result)
 +}
 --- a/Sources/AppBundle/command/impl/MoveNodeToWorkspaceCommand.swift
 +++ b/Sources/AppBundle/command/impl/MoveNodeToWorkspaceCommand.swift
-@@ -4,9 +4,13 @@
+@@ -4,9 +4,17 @@
      let args: MoveNodeToWorkspaceCmdArgs
      /*conforms*/ let shouldResetClosedWindowsCache: Bool = true
  
@@ -102,13 +98,17 @@
          guard let target = args.resolveTargetOrReportError(env, io) else { return .fail }
          guard let window = target.windowOrNil else { return .fail(io.err(noWindowIsFocused)) }
 +        if let window = window as? MacWindow {
-+            do { try await window.macApp.synchronizeNativeTabGroups(.nonCancellable) }
++            do {
++                guard try await window.macApp.synchronizeNativeTabGroups(.nonCancellable) else {
++                    return .fail(io.err("Cannot read native tab membership; no windows were moved"))
++                }
++            }
 +            catch { return .fail(io.err("Cannot read native tab membership: \(error)")) }
 +        }
          let subjectWs = window.nodeWorkspace
          let targetWorkspace: Workspace
          switch args.target.val {
-@@ -30,16 +34,25 @@
+@@ -30,16 +38,25 @@
  
  @MainActor
  func moveWindowToWorkspace(_ window: Window, _ targetWorkspace: Workspace, _ io: CmdIo, focusFollowsWindow: Bool, failIfNoop: Bool, index: Int = INDEX_BIND_LAST) -> BinaryExitCode {
@@ -141,7 +141,7 @@
  }
 --- a/Sources/AppBundle/command/impl/MoveNodeToMonitorCommand.swift
 +++ b/Sources/AppBundle/command/impl/MoveNodeToMonitorCommand.swift
-@@ -5,10 +5,14 @@
+@@ -5,10 +5,18 @@
      let args: MoveNodeToMonitorCmdArgs
      /*conforms*/ let shouldResetClosedWindowsCache = true
  
@@ -152,7 +152,11 @@
              return .fail(io.err(noWindowIsFocused))
 +        }
 +        if let window = window as? MacWindow {
-+            do { try await window.macApp.synchronizeNativeTabGroups(.nonCancellable) }
++            do {
++                guard try await window.macApp.synchronizeNativeTabGroups(.nonCancellable) else {
++                    return .fail(io.err("Cannot read native tab membership; no windows were moved"))
++                }
++            }
 +            catch { return .fail(io.err("Cannot read native tab membership: \(error)")) }
          }
          guard let currentMonitor = window.nodeMonitor else {
@@ -169,7 +173,7 @@
          let deadWindowWorkspace = parent.nodeWorkspace
 --- /dev/null
 +++ b/Sources/AppBundle/NativeTabWorkspaces.swift
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,50 @@
 +import Foundation
 +
 +struct NativeTabObservation: Sendable {
@@ -177,11 +181,28 @@
 +    let group: UUID?
 +}
 +
++enum NativeTabSnapshot: Sendable {
++    case unavailable
++    case available([NativeTabObservation])
++}
++
 +// A native tab group owns one workspace. Its selected NSWindow can change,
 +// and some siblings are first discovered only when selected later.
 +struct NativeTabWorkspaces {
 +    private var membership: [UInt32: UUID] = [:]
 +    private var workspaces: [UUID: String] = [:]
++
++    mutating func synchronize(_ snapshot: NativeTabSnapshot, workspaces: [UInt32: String]) -> [UInt32: String]? {
++        guard case .available(let observations) = snapshot else { return nil }
++        var destinations: [UInt32: String] = [:]
++        for observation in observations {
++            guard let workspace = workspaces[observation.windowId] else { continue }
++            if let destination = observe(windowId: observation.windowId, group: observation.group, workspace: workspace) {
++                destinations[observation.windowId] = destination
++            }
++        }
++        return destinations
++    }
 +
 +    mutating func observe(windowId: UInt32, group: UUID?, workspace: String) -> String? {
 +        if membership[windowId] != group { forget(windowId: windowId) }
@@ -205,7 +226,7 @@
 +}
 --- /dev/null
 +++ b/Sources/AppBundleTests/NativeTabWorkspacesTest.swift
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,78 @@
 +@testable import AppBundle
 +import Foundation
 +import XCTest
@@ -260,6 +281,29 @@
 +        XCTAssertEqual(state.move(windowId: 10, to: "3"), [10])
 +        XCTAssertEqual(state.move(windowId: 20, to: "4"), [11, 20])
 +    }
++
++    func testUnavailableSnapshotPreservesMembershipAndRejectsSynchronization() {
++        let group = UUID()
++        var state = NativeTabWorkspaces()
++        _ = state.observe(windowId: 10, group: group, workspace: "1")
++        _ = state.observe(windowId: 11, group: group, workspace: "1")
++        XCTAssertNil(state.synchronize(.unavailable, workspaces: [10: "1", 11: "1"]))
++        // A later successful observation still recovers the original group.
++        XCTAssertEqual(state.observe(windowId: 12, group: group, workspace: "2"), "1")
++        XCTAssertEqual(state.move(windowId: 12, to: "3"), [10, 11, 12])
++    }
++
++    func testSuccessfulStandaloneSnapshotClearsFormerMembership() {
++        let group = UUID()
++        var state = NativeTabWorkspaces()
++        _ = state.observe(windowId: 10, group: group, workspace: "1")
++        _ = state.observe(windowId: 11, group: group, workspace: "1")
++        let snapshot = NativeTabSnapshot.available([NativeTabObservation(windowId: 11, group: nil)])
++        XCTAssertEqual(state.synchronize(snapshot, workspaces: [10: "1", 11: "1"]), [:])
++        XCTAssertEqual(state.move(windowId: 10, to: "3"), [10])
++        XCTAssertEqual(state.move(windowId: 11, to: "4"), [11])
++    }
++
 +}
 --- a/Sources/AppBundle/command/impl/MoveCommand.swift
 +++ b/Sources/AppBundle/command/impl/MoveCommand.swift
