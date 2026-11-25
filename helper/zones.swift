@@ -181,16 +181,53 @@ private func zoneParticipates(subrole: String?, resizable: Bool, app: String, fr
       "com.apple.LocalAuthentication.UIAgent", "io.tailscale.ipn.macsys"].contains(app)
 }
 
+private let zoneBrowsers: Set<String> = ["com.microsoft.edgemac", "com.google.Chrome", "com.apple.Safari"]
+private let zonePlayer = "com.colliderli.iina"
+
 private func zonePreferredSlot(app: String, layout: ZoneLayout) -> Int {
     if app == "com.mitchellh.ghostty" { return layout.slots - 1 }
     // Keep the main browser in the middle when it and a newly opened player
     // arrive in the same pass. A lone window is centered independently below.
-    if ["com.microsoft.edgemac", "com.google.Chrome", "com.apple.Safari"].contains(app) {
-        return min(1, layout.slots - 1)
-    }
+    if zoneBrowsers.contains(app) { return min(1, layout.slots - 1) }
     // New utility/player windows should consume a side before displacing a
     // browser that already owns the center slot.
     return 0
+}
+
+// Two or more normal IINA windows on CR9 share one column, stacked top to
+// bottom by window id. The column is the rightmost one no browser requests,
+// so browsers keep their slots. When a player closes, the survivor keeps the
+// persisted column and the stack collapses to full height.
+private func zoneStackColumn(browserSlots: Set<Int>, slots: Int) -> Int {
+    (0..<slots).reversed().first { !browserSlots.contains($0) } ?? slots - 1
+}
+
+private func zoneStackRow(_ column: CGRect, row: Int, count: Int) -> CGRect {
+    let top = (column.height * CGFloat(row) / CGFloat(count)).rounded()
+    let bottom = (column.height * CGFloat(row + 1) / CGFloat(count)).rounded()
+    return CGRect(x: column.minX, y: column.minY + top, width: column.width, height: bottom - top)
+}
+
+private typealias ZoneMember = (key: String, slot: Int, id: Int, persisted: Bool, preferred: Int)
+
+// Allocates one CR9 area. The player stack takes part as a single member that
+// wins its column; moves into, out of or within the stack are ignored so the
+// next sync cannot flip the plan back.
+private func zoneAreaSlots(_ members: [ZoneMember], players: Set<String>, browsers: Set<String>,
+                           slots: Int, moving: (key: String, slot: Int)?) -> (slots: [String: Int], rows: [String: Int]) {
+    let stack = members.filter { players.contains($0.key) }.sorted { $0.id < $1.id }
+    guard stack.count >= 2, slots > 0 else { return (normalizedSlots(members, slots: slots, moving: moving), [:]) }
+    let column = zoneStackColumn(browserSlots: Set(members.filter { browsers.contains($0.key) }.map {
+        min(max($0.persisted ? $0.slot : $0.preferred, 0), slots - 1) }), slots: slots)
+    let stackKey = "player-stack"
+    let rest = members.filter { !players.contains($0.key) }
+    let move = moving.flatMap { players.contains($0.key) || min(max($0.slot, 0), slots - 1) == column ? nil : $0 }
+    var plan = normalizedSlots(rest + [(key: stackKey, slot: column, id: Int.min, persisted: true, preferred: column)],
+                               slots: slots, moving: move)
+    let slot = plan.removeValue(forKey: stackKey) ?? column
+    var rows: [String: Int] = [:]
+    for (row, member) in stack.enumerated() { plan[member.key] = slot; rows[member.key] = row }
+    return (plan, rows)
 }
 
 // A window can retain a slot from an earlier single-window layout. When a
@@ -353,6 +390,47 @@ func runZones(_ args: [String]) {
         precondition(freshBrowserAndPlayer["edge"] == 1 && freshBrowserAndPlayer["iina"] == 0)
         precondition(zonePreferredSlot(app: "com.microsoft.edgemac", layout: .half) == 1)
         precondition(zonePreferredSlot(app: "com.colliderli.iina", layout: .half) == 0)
+        // Two CR9 players stack in the right column; the browser keeps the
+        // center and the displaced terminal takes the vacated left slot.
+        let stacked = zoneAreaSlots([
+            (key: "edge", slot: 1, id: 2257, persisted: true, preferred: 1),
+            (key: "ghostty", slot: 2, id: 300, persisted: true, preferred: 2),
+            (key: "iina-a", slot: 0, id: 900, persisted: true, preferred: 0),
+            (key: "iina-b", slot: 1, id: 901, persisted: false, preferred: 0)
+        ], players: ["iina-a", "iina-b"], browsers: ["edge"], slots: 3, moving: nil)
+        precondition(stacked.slots == ["edge": 1, "ghostty": 0, "iina-a": 2, "iina-b": 2], "\(stacked)")
+        precondition(stacked.rows == ["iina-a": 0, "iina-b": 1])
+        let column = zoneTarget(display, slot: 2, layout: .half)
+        let upper = zoneStackRow(column, row: 0, count: 2), lower = zoneStackRow(column, row: 1, count: 2)
+        precondition(upper.minY == column.minY && upper.maxY == lower.minY && lower.maxY == column.maxY)
+        precondition(upper.minX == column.minX && lower.width == column.width && upper.height == 720)
+        let odd = CGRect(x: 0, y: 34, width: 1280, height: 1406)
+        precondition(zoneStackRow(odd, row: 0, count: 2).maxY == zoneStackRow(odd, row: 1, count: 2).minY)
+        precondition(zoneStackRow(odd, row: 1, count: 2).maxY == odd.maxY)
+        // A browser already in the right column keeps it; the stack moves left of it.
+        let rightBrowser = zoneAreaSlots([
+            (key: "edge", slot: 2, id: 1, persisted: true, preferred: 1),
+            (key: "iina-a", slot: 2, id: 2, persisted: true, preferred: 0),
+            (key: "iina-b", slot: 2, id: 3, persisted: true, preferred: 0)
+        ], players: ["iina-a", "iina-b"], browsers: ["edge"], slots: 3, moving: nil)
+        precondition(rightBrowser.slots == ["edge": 2, "iina-a": 1, "iina-b": 1])
+        // Moves of stacked players or into the stack column do not flip the plan.
+        for move in [(key: "iina-a", slot: 0), (key: "ghostty", slot: 2)] {
+            let held = zoneAreaSlots([
+                (key: "edge", slot: 1, id: 2257, persisted: true, preferred: 1),
+                (key: "ghostty", slot: 0, id: 300, persisted: true, preferred: 2),
+                (key: "iina-a", slot: 2, id: 900, persisted: true, preferred: 0),
+                (key: "iina-b", slot: 2, id: 901, persisted: true, preferred: 0)
+            ], players: ["iina-a", "iina-b"], browsers: ["edge"], slots: 3, moving: move)
+            precondition(held.slots == ["edge": 1, "ghostty": 0, "iina-a": 2, "iina-b": 2])
+        }
+        // Closing one player collapses the stack: the survivor keeps the column at full height.
+        let collapsed = zoneAreaSlots([
+            (key: "edge", slot: 1, id: 2257, persisted: true, preferred: 1),
+            (key: "ghostty", slot: 0, id: 300, persisted: true, preferred: 2),
+            (key: "iina-b", slot: 2, id: 901, persisted: true, preferred: 0)
+        ], players: ["iina-b"], browsers: ["edge"], slots: 3, moving: nil)
+        precondition(collapsed.slots == ["edge": 1, "ghostty": 0, "iina-b": 2] && collapsed.rows.isEmpty)
         let compact = CGRect(x: 0, y: 34, width: 1512, height: 948)
         let video = zoneConstrainedFrame(compact, size: CGSize(width: 1511, height: 850))!
         precondition(compact.contains(video) && abs(video.midX - compact.midX) <= 0.5)
@@ -369,7 +447,7 @@ func runZones(_ args: [String]) {
         let decoded = try! JSONDecoder().decode(ZoneState.self, from: JSONEncoder().encode(migrated))
         precondition(decoded.layout("11") == .quarters && decoded.layout("12") == .half && decoded.layout("13") == .thirds)
         precondition(ZoneLayout.half.next.next.next == .half)
-        print("PASS: gapless external zones, occupied-slot swaps, laptop stack, lone-window centering and state round-trip")
+        print("PASS: gapless external zones, occupied-slot swaps, CR9 player stack, laptop stack, lone-window centering and state round-trip")
         return
     }
     let valid = ["sync", "status", "half", "thirds", "quarters", "toggle", "left", "center", "right", "step-left", "step-right", "free", "maximize"]
@@ -558,6 +636,7 @@ func runZones(_ args: [String]) {
         // single-window layout.
         var membersByArea: [String: [(key: String, slot: Int, id: Int, persisted: Bool, preferred: Int)]] = [:]
         var areaSlots: [String: Int] = [:]
+        var playerKeys = Set<String>(), browserKeys = Set<String>()
         for row in rows {
             guard let id = row["window-id"] as? Int, normalWindowIDs.contains(id),
                   let pid = row["app-pid"] as? Int,
@@ -569,6 +648,8 @@ func runZones(_ args: [String]) {
             let preferred = zonePreferredSlot(app: app, layout: layout)
             let area = monitor + ":" + ws
             areaSlots[area] = monitor.contains("C49RG9") ? layout.slots : min(4, max(1, windowCounts[area] ?? 1))
+            if monitor.contains("C49RG9"), app == zonePlayer { playerKeys.insert(key) }
+            if zoneBrowsers.contains(app) { browserKeys.insert(key) }
             membersByArea[area, default: []].append(
                 (key: key, slot: placement.slot, id: id,
                  persisted: state.windows[key] != nil, preferred: preferred))
@@ -600,17 +681,21 @@ func runZones(_ args: [String]) {
             }
         }
         var slotAssignments: [String: Int] = [:]
+        var stackRows: [String: (row: Int, count: Int)] = [:]
         for (area, members) in membersByArea {
             let slots = areaSlots[area] ?? 1
             var moving: (key: String, slot: Int)?
             if let member = members.first(where: { $0.id == focus }) {
-                let old = normalizedSlots(members, slots: slots)[member.key] ?? member.slot
+                let old = zoneAreaSlots(members, players: playerKeys, browsers: browserKeys,
+                                        slots: slots, moving: nil).slots[member.key] ?? member.slot
                 if let slot = ["left": 0, "center": 1, "right": slots - 1,
                                "step-left": old - 1, "step-right": old + 1][action] {
                     moving = (member.key, slot)
                 }
             }
-            slotAssignments.merge(normalizedSlots(members, slots: slots, moving: moving)) { _, new in new }
+            let plan = zoneAreaSlots(members, players: playerKeys, browsers: browserKeys, slots: slots, moving: moving)
+            slotAssignments.merge(plan.slots) { _, new in new }
+            for (key, row) in plan.rows { stackRows[key] = (row, plan.rows.count) }
         }
         var liveKeys = Set<String>(), report: [[String: Any]] = [], changed = 0, failed = 0
         for row in rows {
@@ -646,8 +731,10 @@ func runZones(_ args: [String]) {
                               height: primaryHeight - visibleFrame.minY - top)
             let compactSlot = id == focus && ["left", "center", "right", "step-left", "step-right"].contains(action)
                 ? placement.slot : displaySlot
+            let column = zoneTarget(area, slot: placement.slot, layout: layout,
+                centered: windowCounts[occupancyKey] == 1 && placement.anchored != true)
             let target = placement.maximized ? area : (external
-                ? zoneTarget(area, slot: placement.slot, layout: layout, centered: windowCounts[occupancyKey] == 1 && placement.anchored != true)
+                ? stackRows[key].map { zoneStackRow(column, row: $0.row, count: $0.count) } ?? column
                 : zoneCompactTarget(area, slot: compactSlot, count: windowCounts[occupancyKey] ?? 1))
             let needsWrite = row["window-layout"] as? String != "floating" || (zoneRect(window).map { !zoneSame($0, target) } ?? true)
             if action != "status", needsWrite {
